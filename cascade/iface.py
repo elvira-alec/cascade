@@ -316,8 +316,23 @@ def print_wifi_table(networks: list[dict]):
 def connect_wifi(iface_name: str, ssid: str, password: str = None) -> bool:
     """
     Connect to a WiFi network using nmcli.
+    If the interface isn't NM-managed, enable management and rescan first.
     Returns True on success.
     """
+    # Ensure NM manages this interface before trying to connect
+    if not nm_managed(iface_name):
+        tui.info(f"Enabling NetworkManager on {iface_name} ...")
+        set_nm_managed(iface_name, True)
+        time.sleep(2)
+
+    # Trigger NM rescan so it knows about the target network
+    tui.info("Refreshing network list ...")
+    subprocess.call(
+        ["nmcli", "device", "wifi", "rescan", "ifname", iface_name],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    time.sleep(3)
+
     tui.info(f"Connecting to '{ssid}' on {iface_name} ...")
     cmd = ["nmcli", "device", "wifi", "connect", ssid, "ifname", iface_name]
     if password:
