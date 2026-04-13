@@ -9,3 +9,8 @@ build/
 .cascade_sessions.json
 *.pot
 *.hashes
+# never commit vault or exported hashes — contains captured credentials
+~/.cascade/
+vault.json
+export_hashes.txt
+config.json

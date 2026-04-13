@@ -1,10 +1,25 @@
 # Cascade
 
-**Menu-driven post-exploitation kill chain orchestrator.**  
-Run it once you're on the LAN. It guides you through everything.
+**Automated network attack toolkit — two programs, two machines.**
 
-```
+| Program | Machine | Install |
+|---------|---------|---------|
+| `cascade` | Raspberry Pi (Kali) | `pip install -e .` |
+| `cascade-crack` | Windows PC (GPU) | `pip install -e ./cracker` |
+
+```bash
+# On Pi:
+git clone https://github.com/elvira-alec/cascade
+cd cascade
+sudo pip3 install -e .
 sudo cascade
+
+# On Windows PC:
+git clone https://github.com/elvira-alec/cascade
+cd cascade
+pip install -e ./cracker
+cascade-crack
+cascade-doctor   # check dependencies + Tailscale setup
 ```
 
 > For authorized penetration testing only. Only run against networks and systems you own or have explicit written permission to test.
@@ -100,16 +115,49 @@ Press `s` from the main menu:
 ## Install
 
 ```bash
-git clone https://github.com/elvira-alec/cascade
-cd cascade
+git clone https://github.com/your-username/Cascade
+cd Cascade
 sudo pip3 install -e .
 ```
 
-Required tools:
+Required tools (Kali / Debian):
 ```bash
 sudo apt install nmap responder hashcat crackmapexec sshpass smbclient python3-impacket
 sudo gem install evil-winrm
+# mitm6 (optional — requires IPv6 on the network):
+sudo pip3 install mitm6 --break-system-packages
 ```
+
+`sudo cascade` — root is required for Responder and raw sockets.
+
+---
+
+## Vault & GPU offload
+
+All captured hashes and cracked passwords live in `~/.cascade/vault.json` (root: `/root/.cascade/vault.json`).
+
+From the main menu, press `v` to open the vault:
+
+```
+[1] View hashes        — all captured, with timestamp and target IP
+[2] View cracked       — cracked creds ready to use
+[3] Export for GPU     — writes pending hashes to ~/.cascade/export_hashes.txt
+[4] Import cracked     — reads results back from CascadeCracker on Windows
+[5] Shell from vault   — connect to any host with cracked creds
+```
+
+**[CascadeCracker](https://github.com/your-username/CascadeCracker)** runs on your Windows GPU machine and automates the pull → crack → push cycle over Tailscale.
+
+---
+
+## Remote use (phone → Pi → Windows)
+
+1. Install [Tailscale](https://tailscale.com) on Pi and Windows, log into same account.
+2. Enable Windows OpenSSH Server (`cascade-doctor` on Windows walks you through it).
+3. From Pi: `ssh <windows-user>@<windows-tailscale-ip>`
+4. In Termius on phone: add Pi as SSH host, use it as jump host to reach Windows.
+
+This gives you full GPU cracking power from anywhere via phone.
 
 ---
 

