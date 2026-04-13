@@ -364,24 +364,26 @@ def adapter_picker(state: State):
             input(f"  {tui.DIM}[ press Enter ]{tui.R}")
             return
 
-        print(f"  {tui.DIM}Cascade needs {tui.R}{tui.WH}MANAGED{tui.DIM} mode + an IP address on the target LAN.")
-        print(f"  MONITOR = passive sniffing only (use for Fracture/wifite, not Cascade).")
-        print(f"  Pick your adapter, then connect to the target network.{tui.R}")
+        print(f"  {tui.YLW}802.11 mode{tui.R}{tui.DIM} (iwconfig): MANAGED = client/normal, MONITOR = passive sniff only")
+        print(f"  {tui.YLW}NM{tui.R}{tui.DIM} (NetworkManager): whether nmcli/nmtui can control the adapter")
+        print(f"  Cascade needs 802.11 MANAGED + an IP. NM managed = nmtui/scan works.{tui.R}")
         print()
-        print(f"  {tui.WH}{tui.B}  #  NAME          MODE        IP ADDRESS        MAC{tui.R}")
+        print(f"  {tui.WH}{tui.B}  #  NAME          802.11      NM       IP ADDRESS        MAC{tui.R}")
         tui.divider()
         for i, fc in enumerate(interfaces, 1):
             ip_col  = tui.GRN if fc["ip"] else tui.RED
             ip_str  = fc["ip"] or "no IP"
             mode    = fc["mode"] or "wired"
-            m_col   = (tui.YLW if fc["mode"] and "MONITOR" in fc["mode"]
+            m_col   = (tui.RED if fc["mode"] and "MONITOR" in fc["mode"]
                        else tui.GRN if fc["mode"] and "MANAGED" in fc["mode"]
                        else tui.DIM)
+            nm_str  = f"{tui.GRN}yes{tui.R}" if fc.get("nm") else f"{tui.YLW}no{tui.R}"
             cur     = f" {tui.RED}{tui.B}←{tui.R}" if fc["name"] == state.interface else ""
             print(
                 f"  {tui.DIM}{i:>2}{tui.R}  "
                 f"{tui.WH}{tui.B}{fc['name']:<12}{tui.R}  "
                 f"{m_col}{mode:<11}{tui.R}  "
+                f"{nm_str:<4}  "
                 f"{ip_col}{ip_str:<17}{tui.R}  "
                 f"{tui.DIM}{fc['mac'] or ''}{tui.R}{cur}"
             )
@@ -417,6 +419,16 @@ def adapter_picker(state: State):
         # If no IP — offer WiFi scan+connect or nmtui
         if not picked["ip"]:
             tui.warn(f"{picked['name']} has no IP — not connected to any network.")
+
+            # If NM doesn't manage it, offer to enable that first
+            if not picked.get("nm"):
+                print()
+                tui.warn(f"{picked['name']} is NOT managed by NetworkManager.")
+                tui.info("This means nmtui and nmcli won't see it — WiFi scan uses iwlist instead.")
+                ans = input(f"\n  {tui.WH}Enable NetworkManager management for {picked['name']}? [Y/n] {tui.R}").strip().lower()
+                if ans != "n":
+                    iface.set_nm_managed(picked["name"], True)
+
             print(f"\n  {tui.WH}How do you want to connect?{tui.R}\n")
             print(f"  {tui.RED}{tui.B}1{tui.R}  Scan for WiFi networks and connect")
             print(f"  {tui.RED}{tui.B}2{tui.R}  Launch nmtui (full network manager)")

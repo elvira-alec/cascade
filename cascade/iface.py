@@ -50,6 +50,7 @@ def list_interfaces() -> list[dict]:
         if mode is not None:
             i["mode"]     = mode
             i["wireless"] = True
+        i["nm"] = nm_managed(i["name"])
 
     return [i for i in ifaces if i["name"] != "lo"]
 
@@ -68,6 +69,47 @@ def _get_wireless_mode(name: str):
 
 def list_wireless() -> list[dict]:
     return [i for i in list_interfaces() if i["wireless"]]
+
+
+# ── NetworkManager management status ─────────────────────────────────────────
+
+def nm_managed(name: str) -> bool:
+    """
+    Return True if NetworkManager is actively managing this interface.
+    NOTE: iwconfig Mode:Managed (802.11 client mode) is completely separate
+    from this — an interface can be 802.11 managed-mode but NM-unmanaged.
+    """
+    try:
+        out = subprocess.check_output(
+            ["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"],
+            text=True, stderr=subprocess.DEVNULL
+        )
+        for line in out.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 2 and parts[0].strip() == name:
+                return parts[1].strip() not in ("unmanaged", "unavailable", "")
+    except Exception:
+        pass
+    return False
+
+
+def set_nm_managed(name: str, managed: bool = True) -> bool:
+    """Tell NetworkManager to manage (or stop managing) an interface."""
+    val = "yes" if managed else "no"
+    try:
+        result = subprocess.run(
+            ["nmcli", "device", "set", name, "managed", val],
+            text=True, capture_output=True
+        )
+        if result.returncode == 0:
+            tui.success(f"NetworkManager now {'manages' if managed else 'ignores'} {name}")
+            time.sleep(1)
+            return True
+        tui.error(result.stderr.strip())
+        return False
+    except FileNotFoundError:
+        tui.error("nmcli not found — install: sudo apt install network-manager")
+        return False
 
 
 # ── adapter mode switching ────────────────────────────────────────────────────
@@ -144,14 +186,16 @@ def scan_wifi(iface_name: str) -> list[dict]:
 
     tui.info(f"Scanning for WiFi networks on {iface_name} ...")
 
-    # Try nmcli first
-    networks = _scan_wifi_nmcli(iface_name)
+    # nmcli only works if NetworkManager manages the interface
+    if nm_managed(iface_name):
+        networks = _scan_wifi_nmcli(iface_name)
+        if networks:
+            return networks
+        tui.info("nmcli returned no results — falling back to iwlist ...")
+    else:
+        tui.info(f"{iface_name} is not managed by NetworkManager — using iwlist ...")
 
-    # Fall back to iwlist if nmcli returned nothing
-    if not networks:
-        networks = _scan_wifi_iwlist(iface_name)
-
-    return networks
+    return _scan_wifi_iwlist(iface_name)
 
 
 def _scan_wifi_nmcli(iface_name: str) -> list[dict]:
