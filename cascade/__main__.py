@@ -478,7 +478,7 @@ def wifi_connect_flow(state: State):
             tui.warn("No password entered — aborting.")
             return
 
-    if iface.connect_wifi(state.interface, ssid, password):
+    if iface.connect_wifi(state.interface, ssid, password, bssid=target["bssid"]):
         state.subnet = None    # force re-detect now that we have an IP
         tui.success(f"Connected. Subnet: {tui.WH}{state.effective_subnet()}{tui.R}")
     else:

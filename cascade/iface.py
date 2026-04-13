@@ -313,13 +313,17 @@ def print_wifi_table(networks: list[dict]):
 
 # ── WiFi connection ───────────────────────────────────────────────────────────
 
-def connect_wifi(iface_name: str, ssid: str, password: str = None) -> bool:
+def connect_wifi(iface_name: str, ssid: str, password: str = None,
+                 bssid: str = None) -> bool:
     """
     Connect to a WiFi network using nmcli.
+    Connects by BSSID when available — bypasses NM scan requirement.
     Returns True on success.
     """
     tui.info(f"Connecting to '{ssid}' on {iface_name} ...")
-    cmd = ["nmcli", "device", "wifi", "connect", ssid, "ifname", iface_name]
+    # Use BSSID (MAC) instead of SSID — works even if NM hasn't scanned yet
+    target = bssid if bssid else ssid
+    cmd = ["nmcli", "device", "wifi", "connect", target, "ifname", iface_name]
     if password:
         cmd += ["password", password]
     try:
