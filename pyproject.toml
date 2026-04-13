@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cascade"
 version = "1.0.0"
-description = "Automated network attack orchestrator for Raspberry Pi — recon, harvest, crack, lateral movement"
+description = "Network attack toolkit — Attack mode for Pi, Crack mode for Windows GPU machine"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -19,4 +19,4 @@ cascade = "cascade.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["cascade*"]
+include = ["cascade*", "cascade_cracker*"]

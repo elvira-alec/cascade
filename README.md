@@ -2,25 +2,25 @@
 
 **Automated network attack toolkit — two programs, two machines.**
 
-| Program | Machine | Install |
-|---------|---------|---------|
-| `cascade` | Raspberry Pi (Kali) | `pip install -e .` |
-| `cascade-crack` | Windows PC (GPU) | `pip install -e ./cracker` |
+**One repo. Same install on both machines. Choose your mode at launch.**
 
 ```bash
-# On Pi:
+# On Raspberry Pi (Kali):
 git clone https://github.com/elvira-alec/cascade
 cd cascade
-sudo pip3 install -e .
-sudo cascade
+sudo bash install.sh       # installs nmap, responder, impacket, pip, everything
+sudo cascade               # → select [1] Attack mode
 
 # On Windows PC:
 git clone https://github.com/elvira-alec/cascade
 cd cascade
-pip install -e ./cracker
-cascade-crack
-cascade-doctor   # check dependencies + Tailscale setup
+# Right-click install.ps1 → Run as Administrator
+# (or: Set-ExecutionPolicy Bypass -Scope Process; .\install.ps1)
+cascade                    # → select [2] Crack mode
+cascade-doctor             # check dependencies, Tailscale, hashcat, Pi connection
 ```
+
+At launch, Cascade auto-detects your OS and suggests the right mode. Override anytime.
 
 > For authorized penetration testing only. Only run against networks and systems you own or have explicit written permission to test.
 
