@@ -91,7 +91,20 @@ def _confirm(stage_name: str, detail: str, noise: str) -> str:
         if raw == "q":        return "stop"
 
 
+def _require_managed(state: State) -> bool:
+    """Check adapter is in managed mode before running network-facing stages."""
+    if not iface.ensure_managed(state.interface):
+        tui.error("Cannot run this stage in monitor mode. Switch to managed first.")
+        return False
+    if not iface.has_ip(state.interface):
+        tui.error(f"{state.interface} has no IP — connect to the network first (Setup → 3 or 4).")
+        return False
+    return True
+
+
 def run_stage1(state: State) -> bool:
+    if not _require_managed(state):
+        return True   # don't stop chain, just skip
     decision = _confirm(
         "STAGE 1 — RECON",
         f"nmap scan of {state.effective_subnet()}. Finds live hosts, ports, services.",
@@ -115,6 +128,8 @@ def run_stage1(state: State) -> bool:
 
 
 def run_stage2(state: State) -> bool:
+    if not _require_managed(state):
+        return True
     if state.skip_harvest:
         tui.warn("Stage 2 skipped (skip-harvest is ON).")
         return True
@@ -303,6 +318,143 @@ def _print_summary(state: State):
     print()
 
 
+# ── adapter picker (shown at startup + in setup) ──────────────────────────────
+
+def adapter_picker(state: State):
+    """
+    Full adapter selection screen — shows all interfaces with mode, IP,
+    lets user pick, then offers to switch mode or connect to WiFi.
+    """
+    while True:
+        tui.clear()
+        tui.print_banner()
+        tui.phase("SELECT ADAPTER")
+
+        interfaces = iface.list_interfaces()
+        if not interfaces:
+            tui.error("No network interfaces found.")
+            input(f"  {tui.DIM}[ press Enter ]{tui.R}")
+            return
+
+        print(f"  {tui.WH}{tui.B}  #  NAME          MODE        IP ADDRESS        MAC{tui.R}")
+        tui.divider()
+        for i, fc in enumerate(interfaces, 1):
+            ip_col  = tui.GRN if fc["ip"] else tui.RED
+            ip_str  = fc["ip"] or "no IP"
+            mode    = fc["mode"] or "wired"
+            m_col   = (tui.YLW if fc["mode"] and "MONITOR" in fc["mode"]
+                       else tui.GRN if fc["mode"] and "MANAGED" in fc["mode"]
+                       else tui.DIM)
+            cur     = f" {tui.RED}{tui.B}←{tui.R}" if fc["name"] == state.interface else ""
+            print(
+                f"  {tui.DIM}{i:>2}{tui.R}  "
+                f"{tui.WH}{tui.B}{fc['name']:<12}{tui.R}  "
+                f"{m_col}{mode:<11}{tui.R}  "
+                f"{ip_col}{ip_str:<17}{tui.R}  "
+                f"{tui.DIM}{fc['mac'] or ''}{tui.R}{cur}"
+            )
+        tui.divider()
+        print(f"\n  {tui.DIM}Enter number to select  |  0 / Enter → back{tui.R}\n")
+
+        raw = input(f"  {tui.WH}{tui.B}adapter → {tui.R}").strip()
+        if raw in ("0", ""):
+            return
+
+        try:
+            idx = int(raw) - 1
+        except ValueError:
+            continue
+        if not (0 <= idx < len(interfaces)):
+            continue
+
+        picked = interfaces[idx]
+        state.interface = picked["name"]
+        state.subnet    = None    # reset subnet on adapter change
+        tui.success(f"Using adapter: {tui.WH}{tui.B}{picked['name']}{tui.R}")
+        time.sleep(0.4)
+
+        # If wireless and in monitor mode — offer to switch to managed
+        if picked["wireless"] and picked["mode"] and "MONITOR" in picked["mode"]:
+            tui.warn(f"{picked['name']} is in MONITOR mode.")
+            tui.info("Cascade needs MANAGED mode for nmap, Responder, and CME.")
+            ans = input(f"  {tui.WH}Switch to MANAGED now? [Y/n] {tui.R}").strip().lower()
+            if ans != "n":
+                iface.set_mode(picked["name"], "managed")
+                time.sleep(0.5)
+
+        # If no IP — offer WiFi scan+connect or nmtui
+        if not picked["ip"]:
+            tui.warn(f"{picked['name']} has no IP — not connected to any network.")
+            print(f"\n  {tui.WH}How do you want to connect?{tui.R}\n")
+            print(f"  {tui.RED}{tui.B}1{tui.R}  Scan for WiFi networks and connect")
+            print(f"  {tui.RED}{tui.B}2{tui.R}  Launch nmtui (full network manager)")
+            print(f"  {tui.RED}{tui.B}3{tui.R}  Skip — I'll connect manually / using ethernet\n")
+            choice = input(f"  {tui.WH}{tui.B}→ {tui.R}").strip()
+            if choice == "1":
+                wifi_connect_flow(state)
+            elif choice == "2":
+                iface.launch_nmtui()
+        return
+
+
+# ── WiFi scan + connect flow ──────────────────────────────────────────────────
+
+def wifi_connect_flow(state: State):
+    """
+    Scan for nearby WiFi networks on the current adapter,
+    let user pick one, ask for password, and connect.
+    """
+    tui.clear()
+    tui.print_banner()
+    tui.phase(f"WIFI SCAN — {state.interface}")
+
+    networks = iface.scan_wifi(state.interface)
+    if not networks:
+        tui.warn("No networks found. Make sure the adapter is up and in managed mode.")
+        input(f"\n  {tui.DIM}[ press Enter to go back ]{tui.R}")
+        return
+
+    tui.success(f"Found {len(networks)} network(s)")
+    iface.print_wifi_table(networks)
+
+    print(f"\n  {tui.DIM}Enter number to connect  |  r to rescan  |  0 / Enter → back{tui.R}\n")
+    raw = input(f"  {tui.WH}{tui.B}network → {tui.R}").strip().lower()
+
+    if raw in ("0", ""):
+        return
+    if raw == "r":
+        wifi_connect_flow(state)
+        return
+
+    try:
+        idx = int(raw) - 1
+    except ValueError:
+        return
+    if not (0 <= idx < len(networks)):
+        return
+
+    target = networks[idx]
+    ssid   = target["ssid"]
+    sec    = target["security"]
+
+    tui.info(f"Target: {tui.WH}{tui.B}{ssid}{tui.R}  [{sec}]  BSSID: {target['bssid']}")
+
+    password = None
+    if sec != "OPEN":
+        password = input(f"\n  {tui.WH}Password for '{ssid}': {tui.R}").strip()
+        if not password:
+            tui.warn("No password entered — aborting.")
+            return
+
+    if iface.connect_wifi(state.interface, ssid, password):
+        state.subnet = None    # force re-detect now that we have an IP
+        tui.success(f"Connected. Subnet: {tui.WH}{state.effective_subnet()}{tui.R}")
+    else:
+        tui.error("Failed to connect. Wrong password or network unavailable.")
+
+    input(f"\n  {tui.DIM}[ press Enter to continue ]{tui.R}")
+
+
 # ── setup menu ────────────────────────────────────────────────────────────────
 
 def setup_menu(state: State):
@@ -311,36 +463,49 @@ def setup_menu(state: State):
         tui.print_banner()
         tui.phase("SETUP")
 
-        interfaces = iface.list_interfaces()
-        for i in interfaces:
-            ip_str   = i["ip"]   or f"{tui.YLW}no IP{tui.R}"
-            mode_str = f"  [{i['mode']}]" if i["mode"] != "?" else ""
-            ok       = tui.GRN if i["ip"] else tui.RED
-            print(f"    {ok}{i['name']:<12}{tui.R}  {tui.WH}{ip_str:<16}{tui.R}"
-                  f"  {tui.DIM}{i['mac'] or ''}{tui.R}{mode_str}")
+        # Current state summary
+        cur_iface = next(
+            (i for i in iface.list_interfaces() if i["name"] == state.interface),
+            None
+        )
+        ip_str   = (cur_iface["ip"] if cur_iface and cur_iface["ip"]
+                    else f"{tui.RED}no IP{tui.R}")
+        mode_str = (cur_iface["mode"] if cur_iface and cur_iface["mode"]
+                    else "wired")
+        m_col    = (tui.YLW if cur_iface and cur_iface["mode"]
+                    and "MONITOR" in cur_iface["mode"] else tui.GRN)
 
+        print(f"  {tui.DIM}Adapter :{tui.R}  {tui.WH}{tui.B}{state.interface}{tui.R}"
+              f"  {m_col}[{mode_str}]{tui.R}  {tui.WH}{ip_str}{tui.R}")
+        print(f"  {tui.DIM}Subnet  :{tui.R}  {tui.WH}{state.subnet or 'auto-detect'}{tui.R}")
+        print(f"  {tui.DIM}Target  :{tui.R}  {tui.WH}{state.target_host or 'all hosts'}{tui.R}")
         print()
         tui.divider()
-        print(f"  {tui.RED}{tui.B} 1{tui.R}  {tui.WH}Select LAN interface{tui.R}"
-              f"  {tui.DIM}current: {state.interface}{tui.R}")
+
+        print(f"  {tui.RED}{tui.B} 1{tui.R}  {tui.WH}Select adapter{tui.R}"
+              f"          {tui.DIM}pick interface + mode, see all adapters{tui.R}")
         print(f"  {tui.RED}{tui.B} 2{tui.R}  {tui.WH}Switch adapter mode{tui.R}"
-              f"  {tui.DIM}(managed ↔ monitor for wireless adapters){tui.R}")
-        print(f"  {tui.RED}{tui.B} 3{tui.R}  {tui.WH}Set subnet manually{tui.R}"
-              f"  {tui.DIM}current: {state.subnet or 'auto-detect'}{tui.R}")
-        print(f"  {tui.RED}{tui.B} 4{tui.R}  {tui.WH}Set target host{tui.R}"
-              f"  {tui.DIM}current: {state.target_host or 'all hosts'}{tui.R}")
-        print(f"  {tui.RED}{tui.B} 5{tui.R}  {tui.WH}Set Responder window{tui.R}"
-              f"  {tui.DIM}current: {state.harvest_time}s{tui.R}")
-        print(f"  {tui.RED}{tui.B} 6{tui.R}  {tui.WH}Set custom wordlist{tui.R}"
-              f"  {tui.DIM}current: {state.wordlist or 'rockyou.txt (default)'}{tui.R}")
-        print(f"  {tui.RED}{tui.B} 7{tui.R}  {tui.WH}Toggle skip-harvest{tui.R}"
-              f"  {tui.DIM}current: {'ON (Responder will be skipped)' if state.skip_harvest else 'off'}{tui.R}")
-        print(f"  {tui.RED}{tui.B} 8{tui.R}  {tui.WH}Toggle verbose{tui.R}"
-              f"  {tui.DIM}current: {'on' if state.verbose else 'off'}{tui.R}")
-        print(f"  {tui.RED}{tui.B} 9{tui.R}  {tui.WH}Connect to network (nmtui){tui.R}"
-              f"  {tui.DIM}recommended if not connected to target LAN{tui.R}")
-        print(f"  {tui.RED}{tui.B}10{tui.R}  {tui.WH}Show tool status{tui.R}"
-              f"  {tui.DIM}which required tools are installed{tui.R}")
+              f"     {tui.DIM}managed ↔ monitor  (current: {mode_str}){tui.R}")
+        print(f"  {tui.RED}{tui.B} 3{tui.R}  {tui.WH}Scan WiFi + connect{tui.R}"
+              f"     {tui.DIM}scan nearby networks, pick one, enter password{tui.R}")
+        print(f"  {tui.RED}{tui.B} 4{tui.R}  {tui.WH}Connect via nmtui{tui.R}"
+              f"       {tui.DIM}full interactive network manager{tui.R}")
+        print()
+        print(f"  {tui.RED}{tui.B} 5{tui.R}  {tui.WH}Set subnet manually{tui.R}"
+              f"     {tui.DIM}current: {state.subnet or 'auto-detect'}{tui.R}")
+        print(f"  {tui.RED}{tui.B} 6{tui.R}  {tui.WH}Set target host{tui.R}"
+              f"         {tui.DIM}current: {state.target_host or 'all hosts'}{tui.R}")
+        print(f"  {tui.RED}{tui.B} 7{tui.R}  {tui.WH}Set Responder window{tui.R}"
+              f"    {tui.DIM}current: {state.harvest_time}s{tui.R}")
+        print(f"  {tui.RED}{tui.B} 8{tui.R}  {tui.WH}Set custom wordlist{tui.R}"
+              f"     {tui.DIM}current: {state.wordlist or 'rockyou.txt'}{tui.R}")
+        print()
+        print(f"  {tui.RED}{tui.B} 9{tui.R}  {tui.WH}Toggle skip-harvest{tui.R}"
+              f"     {tui.DIM}{'ON — Responder skipped' if state.skip_harvest else 'off'}{tui.R}")
+        print(f"  {tui.RED}{tui.B}10{tui.R}  {tui.WH}Toggle verbose{tui.R}"
+              f"          {tui.DIM}{'on' if state.verbose else 'off'}{tui.R}")
+        print(f"  {tui.RED}{tui.B}11{tui.R}  {tui.WH}Tool status{tui.R}"
+              f"             {tui.DIM}what's installed, what's missing{tui.R}")
         tui.divider()
         print(f"\n  {tui.DIM}   0 / Enter → back{tui.R}\n")
 
@@ -350,110 +515,95 @@ def setup_menu(state: State):
             return
 
         elif raw == "1":
-            _pick_interface(state, interfaces)
+            adapter_picker(state)
 
         elif raw == "2":
-            _switch_mode_menu(interfaces)
+            _switch_mode_prompt(state)
 
         elif raw == "3":
-            v = input(f"\n  {tui.WH}Subnet CIDR (e.g. 192.168.1.0/24, blank = auto): {tui.R}").strip()
-            state.subnet = v or None
-            tui.success(f"Subnet set to: {state.subnet or 'auto-detect'}")
-            time.sleep(0.8)
+            wifi_connect_flow(state)
 
         elif raw == "4":
-            v = input(f"\n  {tui.WH}Target IP (blank = all hosts): {tui.R}").strip()
-            state.target_host = v or None
-            tui.success(f"Target set to: {state.target_host or 'all hosts'}")
-            time.sleep(0.8)
+            iface.launch_nmtui()
 
         elif raw == "5":
-            v = input(f"\n  {tui.WH}Responder window in seconds (current: {state.harvest_time}): {tui.R}").strip()
+            v = input(f"\n  {tui.WH}Subnet CIDR (blank = auto): {tui.R}").strip()
+            state.subnet = v or None
+            tui.success(f"Subnet: {state.subnet or 'auto-detect'}")
+            time.sleep(0.8)
+
+        elif raw == "6":
+            v = input(f"\n  {tui.WH}Target IP (blank = all hosts): {tui.R}").strip()
+            state.target_host = v or None
+            tui.success(f"Target: {state.target_host or 'all hosts'}")
+            time.sleep(0.8)
+
+        elif raw == "7":
+            v = input(f"\n  {tui.WH}Responder window seconds [{state.harvest_time}]: {tui.R}").strip()
             try:
                 state.harvest_time = int(v)
-                tui.success(f"Harvest time set to {state.harvest_time}s")
+                tui.success(f"Harvest time: {state.harvest_time}s")
             except ValueError:
                 tui.warn("Invalid number.")
             time.sleep(0.8)
 
-        elif raw == "6":
-            v = input(f"\n  {tui.WH}Wordlist path (blank = default rockyou.txt): {tui.R}").strip()
+        elif raw == "8":
+            v = input(f"\n  {tui.WH}Wordlist path (blank = default): {tui.R}").strip()
             state.wordlist = v or None
             tui.success(f"Wordlist: {state.wordlist or 'default'}")
             time.sleep(0.8)
 
-        elif raw == "7":
+        elif raw == "9":
             state.skip_harvest = not state.skip_harvest
             tui.success(f"Skip-harvest: {'ON' if state.skip_harvest else 'off'}")
             time.sleep(0.8)
 
-        elif raw == "8":
+        elif raw == "10":
             state.verbose = not state.verbose
             tui.success(f"Verbose: {'on' if state.verbose else 'off'}")
             time.sleep(0.8)
 
-        elif raw == "9":
-            iface.launch_nmtui()
-
-        elif raw == "10":
-            tui.clear()
-            tui.print_banner()
-            tui.phase("TOOL STATUS")
+        elif raw == "11":
+            tui.clear(); tui.print_banner(); tui.phase("TOOL STATUS")
             iface.print_tool_status()
             input(f"  {tui.DIM}[ press Enter to go back ]{tui.R}")
 
 
-def _pick_interface(state: State, interfaces: list[dict]):
-    if not interfaces:
-        tui.warn("No interfaces found.")
-        return
-    print()
-    for i, ifc in enumerate(interfaces, 1):
-        ip_str = ifc["ip"] or f"{tui.YLW}no IP{tui.R}"
-        print(f"  {tui.RED}{tui.B}{i:>2}{tui.R}  {tui.WH}{ifc['name']:<12}{tui.R}  {ip_str}")
-    print()
-    raw = input(f"  {tui.WH}Select interface [1-{len(interfaces)}]: {tui.R}").strip()
-    try:
-        idx = int(raw) - 1
-        if 0 <= idx < len(interfaces):
-            state.interface = interfaces[idx]["name"]
-            state.subnet    = None   # reset subnet when interface changes
-            tui.success(f"Interface set to: {state.interface}")
-            # Warn if no IP
-            if not interfaces[idx]["ip"]:
-                print()
-                iface.connection_advice(state.interface)
-                input(f"  {tui.DIM}[ press Enter to continue ]{tui.R}")
-    except ValueError:
-        pass
-    time.sleep(0.4)
-
-
-def _switch_mode_menu(interfaces: list[dict]):
-    wireless = [i for i in interfaces if i["mode"] not in ("?", "N/A", None)]
+def _switch_mode_prompt(state: State):
+    """Switch the current adapter's mode."""
+    wireless = iface.list_wireless()
     if not wireless:
-        tui.warn("No wireless adapters detected.")
+        tui.warn("No wireless adapters found.")
         time.sleep(1)
         return
-    print()
-    for i, ifc in enumerate(wireless, 1):
-        print(f"  {tui.RED}{tui.B}{i:>2}{tui.R}  {tui.WH}{ifc['name']:<12}{tui.R}  "
-              f"{tui.YLW}[{ifc['mode']}]{tui.R}")
-    print()
-    raw = input(f"  {tui.WH}Select adapter [1-{len(wireless)}]: {tui.R}").strip()
+
+    tui.clear(); tui.print_banner(); tui.phase("SWITCH ADAPTER MODE")
+    print(f"  {tui.WH}{tui.B}  #  NAME          CURRENT MODE{tui.R}")
+    tui.divider()
+    for i, w in enumerate(wireless, 1):
+        m_col = tui.YLW if w["mode"] and "MONITOR" in w["mode"] else tui.GRN
+        cur   = f" {tui.RED}{tui.B}←{tui.R}" if w["name"] == state.interface else ""
+        print(f"  {tui.DIM}{i:>2}{tui.R}  {tui.WH}{w['name']:<12}{tui.R}  "
+              f"{m_col}{w['mode']}{tui.R}{cur}")
+    tui.divider()
+    print(f"\n  {tui.DIM}0 / Enter → back{tui.R}\n")
+
+    raw = input(f"  {tui.WH}{tui.B}adapter → {tui.R}").strip()
+    if raw in ("0", ""):
+        return
     try:
         idx = int(raw) - 1
-        if 0 <= idx < len(wireless):
-            name    = wireless[idx]["name"]
-            current = wireless[idx]["mode"].lower()
-            target  = "managed" if "monitor" in current else "monitor"
-            confirm = input(
-                f"\n  {tui.WH}Switch {name} from {tui.YLW}{current}{tui.R} "
-                f"to {tui.YLW}{target}{tui.R}? [Y/n] {tui.R}"
-            ).strip().lower()
-            if confirm != "n":
-                iface.set_mode(name, target)
-                time.sleep(1)
+        if not (0 <= idx < len(wireless)):
+            return
+        w       = wireless[idx]
+        current = (w["mode"] or "").upper()
+        target  = "managed" if "MONITOR" in current else "monitor"
+        print(f"\n  {tui.WH}Switch {tui.B}{w['name']}{tui.R} "
+              f"from {tui.YLW}{current}{tui.R} → {tui.YLW}{target.upper()}{tui.R}")
+        ans = input(f"  Confirm? [Y/n] {tui.R}").strip().lower()
+        if ans != "n":
+            iface.set_mode(w["name"], target)
+            time.sleep(1)
     except (ValueError, IndexError):
         pass
 
@@ -662,7 +812,8 @@ def main():
     ap.parse_args()
 
     state = State()
-    # Pick first interface that has an IP as default
+
+    # Auto-select first interface that already has an IP
     for i in iface.list_interfaces():
         if i["ip"] and i["name"] != "lo":
             state.interface = i["name"]
@@ -670,6 +821,15 @@ def main():
 
     tui.clear()
     tui.print_banner()
+
+    # If nothing is connected, run adapter picker before main menu
+    if not iface.has_ip(state.interface):
+        tui.warn("No connected interface detected.")
+        tui.info("Let's pick an adapter and get you on the network first.")
+        print()
+        input(f"  {tui.DIM}[ press Enter to open adapter picker ]{tui.R}")
+        adapter_picker(state)
+
     main_menu(state)
 
 
