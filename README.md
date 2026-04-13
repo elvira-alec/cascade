@@ -1,7 +1,7 @@
 # Cascade
 
-**Automated post-exploitation kill chain orchestrator.**  
-One command. Five stages. From blank LAN to live shell.
+**Menu-driven post-exploitation kill chain orchestrator.**  
+Run it once you're on the LAN. It guides you through everything.
 
 ```
 sudo cascade
@@ -13,35 +13,87 @@ sudo cascade
 
 ## What it does
 
-Cascade automates the internal network kill chain — everything after you have a foothold on a LAN segment (via ethernet, evil twin, or any other initial access). It chains five stages into a single red TUI:
+Cascade automates the internal network kill chain — guided, menu-driven, with confirmation at every stage so you control the noise level. It chains five stages from subnet discovery to live shells.
 
-| Stage | Name | What it does |
-|-------|------|-------------|
-| 1 | **Recon** | nmap sweeps the subnet — finds hosts, ports, OS, services |
-| 2 | **Hash Harvest** | Responder poisons LLMNR/NBT-NS/WPAD — Windows machines hand over NTLMv2 hashes automatically |
-| 3 | **Cred Spray** | Tries default/common credentials (admin/admin, root/root, etc.) against SSH, SMB, and HTTP admin panels on every host — threaded |
-| 4 | **Hash Cracking** | Feeds captured NTLMv2 hashes into hashcat (mode 5600) against rockyou.txt |
-| 5 | **Lateral Movement** | CrackMapExec over SMB/WinRM + paramiko over SSH using every valid credential |
+```
+CASCADE v1.0.0
 
-After the kill chain, a **shell manager** lets you connect directly to compromised hosts — no manual commands needed.
+  Interface : eth0    IP: 192.168.1.50    Subnet: 192.168.1.0/24
+  Adapter   : wlan1   Mode: MANAGED       Target: all hosts
+
+   1  Full kill chain    guided: recon → harvest → spray → crack → lateral → shells
+   2  Recon              nmap scan — find hosts, ports, services
+   3  Hash harvest       Responder — capture NTLMv2 hashes passively
+   4  Cred spray         SSH / SMB / HTTP default credential spray
+   5  Crack hashes       hashcat NTLMv2 against wordlist
+   6  Lateral movement   CrackMapExec + SSH with found credentials
+
+   7  Shell manager      connect to compromised hosts
+   8  Saved sessions     reconnect to saved sessions
+
+   s  Setup    f  Free commands (bash)    h  Help    q  Quit
+```
+
+---
+
+## The kill chain
+
+| Stage | Name | Noise | What it does |
+|-------|------|-------|-------------|
+| 1 | **Recon** | LOW | nmap sweeps subnet — hosts, ports, services, OS |
+| 2 | **Hash Harvest** | MEDIUM | Responder poisons LLMNR/NBT-NS — Windows machines hand over NTLMv2 hashes |
+| 3 | **Cred Spray** | MEDIUM | Default credentials (admin/admin, root/root...) vs SSH, SMB, HTTP |
+| 4 | **Hash Cracking** | ZERO | hashcat locally against rockyou.txt — no network traffic |
+| 5 | **Lateral Movement** | HIGH | CrackMapExec + SSH pivoting with every valid credential |
+
+Each stage shows what it will do and asks for confirmation. You can skip any stage or stop the chain early.
+
+---
+
+## Adapter state
+
+Cascade uses a LAN interface in **MANAGED** mode — normal operation. Do not put your interface in monitor mode, as Responder and nmap both need standard managed networking. Monitor mode is for WiFi capture tools (Fracture, wifite, airgeddon).
+
+Your interface must have an IP on the target LAN before running. If it doesn't:
+
+- **Ethernet** — plug into any switch port, DHCP assigns an IP automatically
+- **WiFi** — Setup → option 9 launches `nmtui` for interactive WiFi connection
+- **Evil twin first** — use airgeddon/portal_cloner to get the WiFi password, then connect
 
 ---
 
 ## Shell manager
 
-After stage 5, Cascade shows every compromised host and the connection methods available for each one (based on open ports and installed tools):
+After lateral movement, Cascade opens a shell manager. It only shows connection methods that are available based on open ports and installed tools:
 
-- **CMD shell (psexec / SYSTEM)** — port 445 + impacket-psexec  
-- **CMD shell (wmiexec / user)** — port 445 + impacket-wmiexec  
-- **PowerShell (evil-winrm)** — port 5985 + evil-winrm  
-- **SSH shell** — port 22 + ssh/sshpass  
-- **Browse SMB files** — port 445 + smbclient  
+| Method | Requires |
+|--------|---------|
+| CMD shell (psexec / SYSTEM) | port 445 + `impacket-psexec` |
+| CMD shell (wmiexec / user) | port 445 + `impacket-wmiexec` |
+| PowerShell (evil-winrm) | port 5985 + `evil-winrm` |
+| SSH shell | port 22 + `sshpass` |
+| Browse SMB files | port 445 + `smbclient` |
 
-Sessions are saved to `~/.cascade_sessions.json`. Reconnect anytime:
+Sessions are saved to `~/.cascade_sessions.json`. Reconnect anytime with `sudo cascade` → option 8.
 
-```
-sudo cascade --shells
-```
+---
+
+## Setup menu
+
+Press `s` from the main menu:
+
+| Option | What it does |
+|--------|-------------|
+| 1 | Select LAN interface (eth0, wlan0, etc.) |
+| 2 | Switch adapter mode (managed ↔ monitor) |
+| 3 | Set subnet manually (default: auto-detect) |
+| 4 | Set specific target host (default: whole subnet) |
+| 5 | Set Responder window in seconds (default: 120) |
+| 6 | Custom wordlist for cracking |
+| 7 | Toggle skip-harvest (quiet mode) |
+| 8 | Toggle verbose output |
+| 9 | Connect to network (launches nmtui) |
+| 10 | Show which required tools are installed |
 
 ---
 
@@ -55,26 +107,8 @@ sudo pip3 install -e .
 
 Required tools:
 ```bash
-sudo apt install nmap responder hashcat crackmapexec sshpass python3-impacket
+sudo apt install nmap responder hashcat crackmapexec sshpass smbclient python3-impacket
 sudo gem install evil-winrm
-```
-
----
-
-## Usage
-
-```bash
-sudo cascade                              # full auto, detect subnet from interface
-sudo cascade -i eth0                      # specify interface
-sudo cascade --subnet 192.168.1.0/24      # specify subnet manually
-sudo cascade --no-harvest                 # skip Responder (quiet/passive mode)
-sudo cascade --harvest-time 300           # longer hash capture window (seconds)
-sudo cascade --full-scan                  # full port scan instead of fast top-100
-sudo cascade --wordlist /path/to/list.txt # custom wordlist for cracking
-sudo cascade --stage 3                    # run only one stage (1-5)
-sudo cascade --shells                     # jump straight to saved session manager
-sudo cascade --about                      # full description of all stages
-sudo cascade -v                           # verbose output
 ```
 
 ---
@@ -83,14 +117,15 @@ sudo cascade -v                           # verbose output
 
 ```
 cascade/
-├── __main__.py   # entry point, kill chain orchestration
-├── tui.py        # terminal UI — red banner, phase/info/success/warn/error
+├── __main__.py   # entry point, main menu, kill chain orchestration
+├── tui.py        # terminal UI — red banner, status functions
+├── iface.py      # interface detection, adapter mode switching, nmtui
 ├── recon.py      # nmap subnet scanner
-├── harvest.py    # Responder wrapper + hash capture
+├── harvest.py    # Responder wrapper + NTLMv2 hash capture
 ├── spray.py      # default credential spray (SSH, SMB, HTTP)
 ├── crack.py      # hashcat / john NTLMv2 cracker
 ├── lateral.py    # CrackMapExec + SSH lateral movement
-└── shells.py     # interactive shell manager + session store
+└── shells.py     # interactive shell manager + session persistence
 ```
 
 ---

