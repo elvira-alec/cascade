@@ -29,13 +29,14 @@ def scan(subnet: str = None, fast: bool = True) -> list[dict]:
 
     tui.info(f"Scanning {subnet} ...")
 
-    args = ["nmap", "-sV", "--open", "-T4", "-n"]
     if fast:
-        args += ["-F"]          # top 100 ports
+        # Quick port detection — top 100 ports, no service probing
+        args = ["nmap", "--open", "-T4", "-n", "-F",
+                "--host-timeout", "30s", subnet]
     else:
-        args += ["-p-", "--min-rate=1000"]
-
-    args += ["--host-timeout", "10s", subnet]
+        # Full scan — service detection, all ports
+        args = ["nmap", "-sV", "--open", "-T4", "-n", "-p-",
+                "--min-rate=1000", "--host-timeout", "60s", subnet]
 
     try:
         result = subprocess.run(
