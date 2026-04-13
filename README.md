@@ -84,15 +84,15 @@ Press `s` from the main menu:
 
 | Option | What it does |
 |--------|-------------|
-| 1 | Select LAN interface (eth0, wlan0, etc.) |
-| 2 | Switch adapter mode (managed ↔ monitor) |
-| 3 | Set subnet manually (default: auto-detect) |
-| 4 | Set specific target host (default: whole subnet) |
-| 5 | Set Responder window in seconds (default: 120) |
-| 6 | Custom wordlist for cracking |
-| 7 | Toggle skip-harvest (quiet mode) |
-| 8 | Toggle verbose output |
-| 9 | Connect to network (launches nmtui) |
+| 1 | Change adapter (re-runs startup wizard — auto-fixes modes) |
+| 2 | Scan WiFi + connect (scan nearby networks, pick, enter password) |
+| 3 | Connect via nmtui (full interactive network manager) |
+| 4 | Set subnet manually (default: auto-detect) |
+| 5 | Set specific target host (default: whole subnet) |
+| 6 | Set Responder window in seconds (default: 120) |
+| 7 | Custom wordlist for cracking |
+| 8 | Toggle skip-harvest (quiet mode) |
+| 9 | Toggle verbose output |
 | 10 | Show which required tools are installed |
 
 ---
