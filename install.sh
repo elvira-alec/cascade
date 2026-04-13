@@ -60,18 +60,37 @@ echo -e "  ${WH}[3/4] Setting up config directory...${R}"
 mkdir -p /root/.cascade
 echo -e "  ${GRN}Created /root/.cascade${R}"
 
-# ── Tailscale (optional) ──────────────────────────────────────────────────────
+# ── Tailscale ─────────────────────────────────────────────────────────────────
 echo -e "  ${WH}[4/4] Tailscale check...${R}"
 if command -v tailscale &>/dev/null; then
     TS_IP=$(tailscale ip --4 2>/dev/null || true)
     if [ -n "$TS_IP" ]; then
         echo -e "  ${GRN}Tailscale connected: $TS_IP${R}"
     else
-        echo -e "  ${YLW}Tailscale installed but not connected. Run: tailscale up${R}"
+        echo -e "  ${YLW}Tailscale installed but not logged in.${R}"
+        read -rp "  Connect to Tailscale now? [Y/n]: " yn
+        if [[ "$yn" != "n" && "$yn" != "N" ]]; then
+            tailscale up
+            TS_IP=$(tailscale ip --4 2>/dev/null || true)
+            [ -n "$TS_IP" ] && echo -e "  ${GRN}Connected: $TS_IP${R}" || echo -e "  ${YLW}Not connected yet — run 'tailscale up' later.${R}"
+        fi
     fi
 else
-    echo -e "  ${YLW}Tailscale not installed (optional but recommended for remote access).${R}"
-    echo -e "  ${YLW}Install: curl -fsSL https://tailscale.com/install.sh | sh${R}"
+    echo -e "  ${YLW}Tailscale not installed.${R}"
+    echo -e "  ${DIM}Needed so your Windows PC can SSH into the Pi to sync hashes.${R}"
+    read -rp "  Install Tailscale now? [Y/n]: " yn
+    if [[ "$yn" != "n" && "$yn" != "N" ]]; then
+        curl -fsSL https://tailscale.com/install.sh | sh
+        echo -e "  ${GRN}Installed.${R}"
+        read -rp "  Connect to Tailscale now? [Y/n]: " yn2
+        if [[ "$yn2" != "n" && "$yn2" != "N" ]]; then
+            tailscale up
+            TS_IP=$(tailscale ip --4 2>/dev/null || true)
+            [ -n "$TS_IP" ] && echo -e "  ${GRN}Connected: $TS_IP${R}" || echo -e "  ${YLW}Not connected yet — run 'tailscale up' later.${R}"
+        fi
+    else
+        echo -e "  ${DIM}Skipped. Run later: curl -fsSL https://tailscale.com/install.sh | sh && tailscale up${R}"
+    fi
 fi
 
 echo ""
