@@ -122,16 +122,39 @@ def ensure_managed(name: str) -> bool:
 
 def scan_wifi(iface_name: str) -> list[dict]:
     """
-    Scan for nearby WiFi networks using nmcli.
+    Scan for nearby WiFi networks. Tries nmcli first, falls back to iwlist.
     Returns list of { bssid, ssid, channel, signal, security }.
     """
-    # Bring interface up in managed mode first
+    # Switch to managed if in monitor mode
     mode = _get_wireless_mode(iface_name)
     if mode and "MONITOR" in mode.upper():
         tui.warn(f"{iface_name} is in monitor mode — switching to managed for scan ...")
         set_mode(iface_name, "managed")
 
+    # Bring interface up if it's DOWN
+    try:
+        out = subprocess.check_output(["ip", "link", "show", iface_name],
+                                      text=True, stderr=subprocess.DEVNULL)
+        if "state DOWN" in out or "NO-CARRIER" in out:
+            subprocess.call(["ip", "link", "set", iface_name, "up"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1)
+    except Exception:
+        pass
+
     tui.info(f"Scanning for WiFi networks on {iface_name} ...")
+
+    # Try nmcli first
+    networks = _scan_wifi_nmcli(iface_name)
+
+    # Fall back to iwlist if nmcli returned nothing
+    if not networks:
+        networks = _scan_wifi_iwlist(iface_name)
+
+    return networks
+
+
+def _scan_wifi_nmcli(iface_name: str) -> list[dict]:
     try:
         subprocess.call(
             ["nmcli", "device", "wifi", "rescan", "ifname", iface_name],
@@ -143,18 +166,12 @@ def scan_wifi(iface_name: str) -> list[dict]:
              "device", "wifi", "list", "ifname", iface_name],
             text=True, stderr=subprocess.DEVNULL
         )
-    except FileNotFoundError:
-        # nmcli not available — fall back to iwlist
-        return _scan_wifi_iwlist(iface_name)
-    except Exception as e:
-        tui.warn(f"nmcli scan failed: {e}")
-        return _scan_wifi_iwlist(iface_name)
+    except Exception:
+        return []
 
     networks = []
     for line in out.strip().splitlines():
-        # nmcli -t uses : as separator; BSSIDs have escaped colons (\\:)
-        # Unescape bssid first
-        line = line.replace("\\:", "\x00")
+        line  = line.replace("\\:", "\x00")
         parts = line.split(":")
         if len(parts) < 5:
             continue
@@ -165,22 +182,15 @@ def scan_wifi(iface_name: str) -> list[dict]:
         security = ":".join(parts[4:]).strip() or "OPEN"
         if not bssid or bssid == "--":
             continue
-        networks.append({
-            "bssid":    bssid,
-            "ssid":     ssid or "<hidden>",
-            "channel":  channel,
-            "signal":   signal,
-            "security": security,
-        })
+        networks.append({"bssid": bssid, "ssid": ssid or "<hidden>",
+                         "channel": channel, "signal": signal, "security": security})
 
-    # Deduplicate by BSSID, sort by signal desc
-    seen = set()
-    unique = []
+    seen, unique = set(), []
     for n in networks:
         if n["bssid"] not in seen:
             seen.add(n["bssid"])
             unique.append(n)
-    unique.sort(key=lambda x: int(x["signal"]) if x["signal"].isdigit() else 0,
+    unique.sort(key=lambda x: int(x["signal"]) if x["signal"].lstrip("-").isdigit() else 0,
                 reverse=True)
     return unique
 
@@ -196,28 +206,43 @@ def _scan_wifi_iwlist(iface_name: str) -> list[dict]:
         return []
 
     networks = []
-    current  = {}
+    current  = None
     for line in out.splitlines():
         line = line.strip()
         m = re.search(r"Cell \d+ - Address: ([0-9A-Fa-f:]{17})", line)
         if m:
-            if current.get("bssid"):
+            if current:
                 networks.append(current)
-            current = {"bssid": m.group(1), "ssid": "", "channel": "",
-                       "signal": "", "security": "OPEN"}
-        m = re.search(r'ESSID:"(.+?)"', line)
+            current = {"bssid": m.group(1), "ssid": "<hidden>",
+                       "channel": "", "signal": "", "security": "OPEN"}
+            continue
+        if current is None:
+            continue
+        m = re.search(r'ESSID:"(.*?)"', line)
         if m:
-            current["ssid"] = m.group(1)
+            current["ssid"] = m.group(1) or "<hidden>"
         m = re.search(r"Channel:(\d+)", line)
         if m:
             current["channel"] = m.group(1)
         m = re.search(r"Signal level=(-?\d+)", line)
         if m:
             current["signal"] = m.group(1)
-        if "WPA" in line or "WEP" in line:
-            current["security"] = "WPA2" if "WPA2" in line else "WPA"
-    if current.get("bssid"):
+        # WPA2 > WPA > WEP > OPEN  (upgrade security label as we see IE lines)
+        if "WPA2" in line or "802.11i" in line:
+            current["security"] = "WPA2"
+        elif "WPA" in line and current["security"] == "OPEN":
+            current["security"] = "WPA"
+        elif "WEP" in line and current["security"] == "OPEN":
+            current["security"] = "WEP"
+
+    if current:
         networks.append(current)
+
+    # Sort by signal strength descending
+    networks.sort(
+        key=lambda x: int(x["signal"]) if x["signal"].lstrip("-").isdigit() else -99,
+        reverse=True
+    )
     return networks
 
 

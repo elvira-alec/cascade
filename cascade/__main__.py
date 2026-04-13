@@ -336,6 +336,10 @@ def adapter_picker(state: State):
             input(f"  {tui.DIM}[ press Enter ]{tui.R}")
             return
 
+        print(f"  {tui.DIM}Cascade needs {tui.R}{tui.WH}MANAGED{tui.DIM} mode + an IP address on the target LAN.")
+        print(f"  MONITOR = passive sniffing only (use for Fracture/wifite, not Cascade).")
+        print(f"  Pick your adapter, then connect to the target network.{tui.R}")
+        print()
         print(f"  {tui.WH}{tui.B}  #  NAME          MODE        IP ADDRESS        MAC{tui.R}")
         tui.divider()
         for i, fc in enumerate(interfaces, 1):
@@ -463,33 +467,49 @@ def setup_menu(state: State):
         tui.print_banner()
         tui.phase("SETUP")
 
+        # Guidance box
+        print(f"  {tui.YLW}{tui.B}What mode should my adapter be in?{tui.R}")
+        print(f"  {tui.DIM}Cascade uses {tui.R}{tui.WH}MANAGED{tui.DIM} mode — normal WiFi client mode.")
+        print(f"  MONITOR mode is for passive sniffing (Fracture, wifite, airgeddon).")
+        print(f"  If your adapter shows [MONITOR], switch it to [MANAGED] before attacking.{tui.R}")
+        print()
+        print(f"  {tui.YLW}{tui.B}How do I get on the target network?{tui.R}")
+        print(f"  {tui.DIM}Option A: plug ethernet into a wall port — instant IP, no config needed.")
+        print(f"  Option B: use option 3 below to scan WiFi and connect with a password.")
+        print(f"  Option C: use nmtui (option 4) for full network manager if option 3 fails.{tui.R}")
+        print()
+
         # Current state summary
         cur_iface = next(
             (i for i in iface.list_interfaces() if i["name"] == state.interface),
             None
         )
         ip_str   = (cur_iface["ip"] if cur_iface and cur_iface["ip"]
-                    else f"{tui.RED}no IP{tui.R}")
+                    else f"{tui.RED}no IP — not connected{tui.R}")
         mode_str = (cur_iface["mode"] if cur_iface and cur_iface["mode"]
                     else "wired")
-        m_col    = (tui.YLW if cur_iface and cur_iface["mode"]
+        m_col    = (tui.RED if cur_iface and cur_iface["mode"]
                     and "MONITOR" in cur_iface["mode"] else tui.GRN)
+        mode_warn = (f"  {tui.RED}{tui.B}← switch to MANAGED before attacking!{tui.R}"
+                     if cur_iface and cur_iface["mode"]
+                     and "MONITOR" in cur_iface["mode"] else "")
 
         print(f"  {tui.DIM}Adapter :{tui.R}  {tui.WH}{tui.B}{state.interface}{tui.R}"
-              f"  {m_col}[{mode_str}]{tui.R}  {tui.WH}{ip_str}{tui.R}")
+              f"  {m_col}[{mode_str}]{tui.R}  {tui.WH}{ip_str}{tui.R}{mode_warn}")
         print(f"  {tui.DIM}Subnet  :{tui.R}  {tui.WH}{state.subnet or 'auto-detect'}{tui.R}")
         print(f"  {tui.DIM}Target  :{tui.R}  {tui.WH}{state.target_host or 'all hosts'}{tui.R}")
         print()
         tui.divider()
 
         print(f"  {tui.RED}{tui.B} 1{tui.R}  {tui.WH}Select adapter{tui.R}"
-              f"          {tui.DIM}pick interface + mode, see all adapters{tui.R}")
+              f"          {tui.DIM}see all adapters, pick one, check mode + IP{tui.R}")
         print(f"  {tui.RED}{tui.B} 2{tui.R}  {tui.WH}Switch adapter mode{tui.R}"
-              f"     {tui.DIM}managed ↔ monitor  (current: {mode_str}){tui.R}")
+              f"     {tui.DIM}toggle MANAGED ↔ MONITOR  "
+              f"(current: {m_col}{mode_str}{tui.R}{tui.DIM}){tui.R}")
         print(f"  {tui.RED}{tui.B} 3{tui.R}  {tui.WH}Scan WiFi + connect{tui.R}"
               f"     {tui.DIM}scan nearby networks, pick one, enter password{tui.R}")
         print(f"  {tui.RED}{tui.B} 4{tui.R}  {tui.WH}Connect via nmtui{tui.R}"
-              f"       {tui.DIM}full interactive network manager{tui.R}")
+              f"       {tui.DIM}full interactive network manager (fallback){tui.R}")
         print()
         print(f"  {tui.RED}{tui.B} 5{tui.R}  {tui.WH}Set subnet manually{tui.R}"
               f"     {tui.DIM}current: {state.subnet or 'auto-detect'}{tui.R}")
