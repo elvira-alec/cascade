@@ -403,14 +403,9 @@ def adapter_wizard(state: State):
             tui.info(f"Switching {picked['name']} from MONITOR → MANAGED ...")
             iface.set_mode(picked["name"], "managed")
 
-        # Auto-enable NM management silently, then rescan so NM knows the networks
-        if picked["wireless"] and not picked.get("nm"):
-            tui.info(f"Enabling NetworkManager on {picked['name']} ...")
-            iface.set_nm_managed(picked["name"], True)
-            tui.info("Scanning networks ...")
-            subprocess.call(["nmcli", "device", "wifi", "rescan", "ifname", picked["name"]],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(3)
+        # Bring interface up if needed (wpa_supplicant handles connection for NM-unmanaged)
+        subprocess.call(["ip", "link", "set", picked["name"], "up"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         tui.success(f"Adapter set to {tui.WH}{tui.B}{picked['name']}{tui.R}")
 

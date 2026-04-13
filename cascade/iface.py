@@ -316,12 +316,21 @@ def print_wifi_table(networks: list[dict]):
 def connect_wifi(iface_name: str, ssid: str, password: str = None,
                  bssid: str = None) -> bool:
     """
-    Connect to a WiFi network using nmcli.
-    Connects by BSSID when available — bypasses NM scan requirement.
+    Connect to a WiFi network.
+    Uses nmcli for NM-managed interfaces, wpa_supplicant+dhcpcd for others
+    (e.g. RTL8187/Alfa adapters that NM refuses to manage).
     Returns True on success.
     """
     tui.info(f"Connecting to '{ssid}' on {iface_name} ...")
-    # Use BSSID (MAC) instead of SSID — works even if NM hasn't scanned yet
+
+    if nm_managed(iface_name):
+        return _connect_wifi_nmcli(iface_name, ssid, password, bssid)
+    else:
+        return _connect_wifi_wpa(iface_name, ssid, password)
+
+
+def _connect_wifi_nmcli(iface_name: str, ssid: str, password: str,
+                        bssid: str) -> bool:
     target = bssid if bssid else ssid
     cmd = ["nmcli", "device", "wifi", "connect", target, "ifname", iface_name]
     if password:
@@ -332,15 +341,99 @@ def connect_wifi(iface_name: str, ssid: str, password: str = None,
             tui.success(f"Connected to '{ssid}'")
             time.sleep(2)
             return True
-        else:
-            tui.error(f"Connection failed: {result.stderr.strip()}")
-            return False
+        tui.error(f"Connection failed: {result.stderr.strip()}")
+        return False
     except subprocess.TimeoutExpired:
         tui.error("Connection timed out.")
         return False
     except FileNotFoundError:
         tui.error("nmcli not found — install: sudo apt install network-manager")
         return False
+
+
+_WPA_CTRL = "/run/wpa_supplicant_cascade"
+
+
+def _connect_wifi_wpa(iface_name: str, ssid: str, password: str) -> bool:
+    """Connect via wpa_supplicant + dhcpcd for NM-unmanaged adapters."""
+    import tempfile, os
+
+    # Kill any existing wpa_supplicant and dhcpcd forcefully
+    subprocess.call(["killall", "wpa_supplicant"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.call(["killall", "-9", "dhcpcd"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1)
+
+    # Write wpa_supplicant config (with ctrl_interface so we can poll status)
+    conf = tempfile.NamedTemporaryFile(mode="w", suffix=".conf",
+                                       delete=False, prefix="cascade_wpa_")
+    try:
+        psk_block = ""
+        if password:
+            result = subprocess.run(
+                ["wpa_passphrase", ssid, password],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                tui.error("wpa_passphrase failed.")
+                return False
+            psk_block = result.stdout.strip()
+        else:
+            psk_block = f'network={{\n  ssid="{ssid}"\n  key_mgmt=NONE\n}}'
+
+        conf.write(f"ctrl_interface={_WPA_CTRL}\n\n" + psk_block + "\n")
+        conf.close()
+
+        os.makedirs(_WPA_CTRL, exist_ok=True)
+        subprocess.call(["ip", "link", "set", iface_name, "up"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        r = subprocess.run(
+            ["wpa_supplicant", "-B", "-i", iface_name,
+             "-c", conf.name, "-D", "nl80211,wext"],
+            capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            tui.error(f"wpa_supplicant failed: {r.stderr.strip()}")
+            return False
+
+        # Poll for COMPLETED association (up to 15s)
+        tui.info("Waiting for association ...")
+        ctrl_sock = f"{_WPA_CTRL}/{iface_name}"
+        for _ in range(15):
+            time.sleep(1)
+            try:
+                out = subprocess.check_output(
+                    ["wpa_cli", "-p", _WPA_CTRL, "-i", iface_name, "status"],
+                    text=True, stderr=subprocess.DEVNULL
+                )
+                if "wpa_state=COMPLETED" in out:
+                    break
+            except Exception:
+                pass
+        else:
+            tui.error("Association timed out — wrong password or AP out of range.")
+            return False
+
+        # Get IP via dhcpcd (runs blocking until lease is obtained)
+        try:
+            subprocess.run(["dhcpcd", iface_name],
+                           capture_output=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            pass
+        if has_ip(iface_name):
+            tui.success(f"Connected to '{ssid}'")
+            return True
+
+        tui.error("Associated but couldn't get an IP address.")
+        return False
+
+    except FileNotFoundError as e:
+        tui.error(f"Missing tool: {e}")
+        return False
+    finally:
+        os.unlink(conf.name)
 
 
 # ── connection status ─────────────────────────────────────────────────────────
