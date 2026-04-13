@@ -63,6 +63,27 @@ class State:
         )
 
 
+def _context_hint(state: State):
+    """Print a single dimmed line showing current target/adapter + how to change."""
+    ifaces = iface.list_interfaces()
+    cur = next((i for i in ifaces if i["name"] == state.interface), None)
+    mode    = cur["mode"] if cur and cur["mode"] else "wired"
+    ip      = cur["ip"]   if cur else None
+    m_col   = tui.RED if "MONITOR" in mode else tui.GRN
+    ip_str  = ip or f"{tui.RED}no IP{tui.DIM}"
+    subnet  = state.effective_subnet()
+    target  = state.target_host or "all hosts"
+    print(
+        f"  {tui.DIM}┤ adapter: {tui.R}{tui.WH}{state.interface}{tui.DIM}"
+        f"  [{m_col}{mode}{tui.DIM}]"
+        f"  ip: {tui.R}{tui.WH}{ip_str}{tui.DIM}"
+        f"  subnet: {tui.R}{tui.WH}{subnet}{tui.DIM}"
+        f"  target: {tui.R}{tui.WH}{target}{tui.DIM}"
+        f"  ·  to change any of this → {tui.R}{tui.WH}s → Setup{tui.DIM} from main menu ├{tui.R}"
+    )
+    print()
+
+
 def _iface_status(name: str) -> str:
     for i in iface.list_interfaces():
         if i["name"] == name:
@@ -75,11 +96,13 @@ def _iface_status(name: str) -> str:
 
 # ── stage runners (with confirm) ──────────────────────────────────────────────
 
-def _confirm(stage_name: str, detail: str, noise: str) -> str:
+def _confirm(stage_name: str, detail: str, noise: str, state: State = None) -> str:
     """
     Ask user to continue, skip, or stop.
     Returns 'run', 'skip', or 'stop'.
     """
+    if state:
+        _context_hint(state)
     tui.divider()
     print(f"\n  {tui.RED}{tui.B}{stage_name}{tui.R}")
     print(f"  {tui.DIM}{detail}{tui.R}")
@@ -108,7 +131,8 @@ def run_stage1(state: State) -> bool:
     decision = _confirm(
         "STAGE 1 — RECON",
         f"nmap scan of {state.effective_subnet()}. Finds live hosts, ports, services.",
-        "LOW — passive scan, no exploitation"
+        "LOW — passive scan, no exploitation",
+        state
     )
     if decision == "stop": return False
     if decision == "skip": tui.warn("Stage 1 skipped."); return True
@@ -138,7 +162,8 @@ def run_stage2(state: State) -> bool:
         "STAGE 2 — HASH HARVEST",
         f"Responder poisons LLMNR/NBT-NS on {state.interface} for {state.harvest_time}s.\n"
         f"  Windows machines hand over NTLMv2 hashes automatically.",
-        "MEDIUM — poisoning LLMNR/NBT-NS, visible in Wireshark"
+        "MEDIUM — poisoning LLMNR/NBT-NS, visible in Wireshark",
+        state
     )
     if decision == "stop": return False
     if decision == "skip": tui.warn("Stage 2 skipped."); return True
@@ -163,7 +188,8 @@ def run_stage3(state: State) -> bool:
         "STAGE 3 — CREDENTIAL SPRAY",
         f"Tries default credentials (admin/admin, root/root, etc.) against\n"
         f"  SSH, SMB, and HTTP admin panels on {len(state.hosts)} discovered host(s).",
-        "MEDIUM — login attempts, may trigger lockout policies"
+        "MEDIUM — login attempts, may trigger lockout policies",
+        state
     )
     if decision == "stop": return False
     if decision == "skip": tui.warn("Stage 3 skipped."); return True
@@ -191,7 +217,8 @@ def run_stage4(state: State) -> bool:
         "STAGE 4 — HASH CRACKING",
         f"hashcat NTLMv2 (mode 5600) against rockyou.txt.\n"
         f"  {len(state.hashes)} hash(es) queued.",
-        "LOW — local CPU/GPU, no network traffic"
+        "LOW — local CPU/GPU, no network traffic",
+        state
     )
     if decision == "stop": return False
     if decision == "skip": tui.warn("Stage 4 skipped."); return True
@@ -229,7 +256,8 @@ def run_stage5(state: State) -> bool:
         "STAGE 5 — LATERAL MOVEMENT",
         f"CrackMapExec over SMB/WinRM + SSH with {len(creds)} credential(s)\n"
         f"  against {len(state.hosts)} host(s).",
-        "HIGH — active login attempts on every host, very noisy"
+        "HIGH — active login attempts on every host, very noisy",
+        state
     )
     if decision == "stop": return False
     if decision == "skip": tui.warn("Stage 5 skipped."); return True
@@ -755,27 +783,27 @@ def main_menu(state: State):
             input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
 
         elif raw == "2":
-            tui.clear(); tui.print_banner()
+            tui.clear(); tui.print_banner(); _context_hint(state)
             run_stage1(state)
             input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
 
         elif raw == "3":
-            tui.clear(); tui.print_banner()
+            tui.clear(); tui.print_banner(); _context_hint(state)
             run_stage2(state)
             input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
 
         elif raw == "4":
-            tui.clear(); tui.print_banner()
+            tui.clear(); tui.print_banner(); _context_hint(state)
             run_stage3(state)
             input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
 
         elif raw == "5":
-            tui.clear(); tui.print_banner()
+            tui.clear(); tui.print_banner(); _context_hint(state)
             run_stage4(state)
             input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
 
         elif raw == "6":
-            tui.clear(); tui.print_banner()
+            tui.clear(); tui.print_banner(); _context_hint(state)
             run_stage5(state)
             input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
 
