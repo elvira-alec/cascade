@@ -277,6 +277,31 @@ def config_menu(cfg: dict) -> dict:
     return cfg
 
 
+# ── self-update ───────────────────────────────────────────────────────────────
+
+def _self_update():
+    """git pull + pip install -e . from the repo root."""
+    repo = Path(__file__).resolve().parent.parent
+    print(f"\n  {DIM}Repo: {repo}{R}")
+
+    print(f"  {WH}Pulling latest from GitHub...{R}")
+    r = subprocess.run(["git", "pull"], cwd=str(repo), capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"  {RED}git pull failed:{R}\n  {r.stderr.strip()}")
+        return
+    print(f"  {GRN}{r.stdout.strip() or 'Already up to date.'}{R}")
+
+    print(f"  {WH}Reinstalling package...{R}")
+    r2 = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-e", str(repo), "-q"],
+        capture_output=True, text=True
+    )
+    if r2.returncode != 0:
+        print(f"  {RED}pip install failed:{R}\n  {r2.stderr.strip()}")
+        return
+    print(f"  {GRN}Updated. Restart cascade to use the new version.{R}")
+
+
 # ── main menu ─────────────────────────────────────────────────────────────────
 
 def _banner(cfg: dict):
@@ -334,6 +359,7 @@ def main():
         print(f"  {RED}{B}6{R}  View cracked passwords")
         print()
         print(f"  {RED}{B}d{R}  Doctor / diagnostics       {DIM}check everything, fix setup issues{R}")
+        print(f"  {RED}{B}u{R}  Update                     {DIM}git pull + reinstall latest version{R}")
         print(f"  {RED}{B}c{R}  Configure")
         print(f"  {RED}{B}q{R}  Quit")
         print(f"  {'─' * 50}\n")
@@ -386,6 +412,10 @@ def main():
             from .doctor import run_full_check
             run_full_check(cfg)
             input(f"\n  {DIM}[ press Enter ]{R}")
+
+        elif raw == "u":
+            _self_update()
+            input(f"\n  {DIM}[ press Enter — cascade will restart on next launch ]{R}")
 
         elif raw == "c":
             cfg = config_menu(cfg)

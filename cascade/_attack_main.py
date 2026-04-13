@@ -5,6 +5,7 @@ Only run against networks you own or have explicit written permission to test.
 """
 
 import os, sys, shutil, subprocess, time
+from pathlib import Path
 
 from . import tui, iface
 from . import recon, harvest, spray, crack, lateral, shells, vault
@@ -839,8 +840,8 @@ def main_menu(state: State):
         print(f"  {tui.RED}{tui.B} v{tui.R}  {tui.WH}Vault — hashes & cracked creds{tui.R}"
               f"  {tui.DIM}{_vc} cracked  {_vp} pending{tui.R}")
         print()
-        print(f"  {tui.DIM}   s  Setup          f  Free commands (bash)   "
-              f"h  Help / about   q  Quit{tui.R}")
+        print(f"  {tui.DIM}   s  Setup    f  Free commands (bash)   "
+              f"u  Update   h  Help / about   q  Quit{tui.R}")
         tui.divider()
         print()
 
@@ -919,6 +920,31 @@ def main_menu(state: State):
 
         elif raw == "h":
             _print_about()
+
+        elif raw == "u":
+            _self_update()
+            input(f"\n  {tui.DIM}[ press Enter — restart cascade to use the new version ]{tui.R}")
+
+
+def _self_update():
+    repo = Path(__file__).resolve().parent.parent
+    print(f"\n  {tui.DIM}Repo: {repo}{tui.R}")
+    print(f"  {tui.WH}Pulling latest from GitHub...{tui.R}")
+    r = subprocess.run(["git", "pull"], cwd=str(repo), capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"  {tui.RED}git pull failed:{tui.R}\n  {r.stderr.strip()}")
+        return
+    print(f"  {tui.GRN}{r.stdout.strip() or 'Already up to date.'}{tui.R}")
+    print(f"  {tui.WH}Reinstalling package...{tui.R}")
+    r2 = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-e", str(repo),
+         "--break-system-packages", "-q"],
+        capture_output=True, text=True
+    )
+    if r2.returncode != 0:
+        print(f"  {tui.RED}pip install failed:{tui.R}\n  {r2.stderr.strip()}")
+        return
+    print(f"  {tui.GRN}Updated. Restart cascade to use the new version.{tui.R}")
 
 
 # ── entry point ───────────────────────────────────────────────────────────────

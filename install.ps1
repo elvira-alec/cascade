@@ -97,7 +97,7 @@ if ($wlFound) {
     Write-Host "  ${DIM}(or anywhere — cascade-crack finds it automatically)${R}"
 }
 
-# ── Tailscale check ───────────────────────────────────────────────────────────
+# ── Tailscale ─────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "  ${WH}[5/5] Checking Tailscale...${R}"
 $ts = Get-Command tailscale -ErrorAction SilentlyContinue
@@ -106,12 +106,37 @@ if ($ts) {
     if ($tsip) {
         Write-Host "  ${GRN}Tailscale connected: $tsip${R}"
     } else {
-        Write-Host "  ${YLW}Tailscale installed but not connected.${R}"
-        Write-Host "  ${DIM}Open Tailscale and log in, then run: tailscale up${R}"
+        Write-Host "  ${YLW}Tailscale installed but not logged in.${R}"
+        $yn = Read-Host "  Open Tailscale login now? [Y/n]"
+        if ($yn -ne 'n' -and $yn -ne 'N') {
+            Start-Process "tailscale" -ArgumentList "up" -NoNewWindow -Wait 2>$null
+            Write-Host "  ${DIM}A browser window should have opened — log in with your Tailscale account.${R}"
+            Write-Host "  ${DIM}Both Pi and Windows must use the same Tailscale account.${R}"
+        }
     }
 } else {
-    Write-Host "  ${YLW}Tailscale not installed (needed for Pi ↔ Windows sync).${R}"
-    Write-Host "  ${DIM}Download: https://tailscale.com/download/windows${R}"
+    Write-Host "  ${YLW}Tailscale not installed (needed for Pi <-> Windows hash sync).${R}"
+    $yn = Read-Host "  Install Tailscale now via winget? [Y/n]"
+    if ($yn -ne 'n' -and $yn -ne 'N') {
+        $wg = Get-Command winget -ErrorAction SilentlyContinue
+        if ($wg) {
+            Write-Host "  Installing..."
+            winget install --id tailscale.tailscale --silent --accept-package-agreements --accept-source-agreements
+            # Refresh PATH so tailscale is findable
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+            Write-Host "  ${GRN}Installed. Opening login...${R}"
+            Start-Process "tailscale" -ArgumentList "up" -NoNewWindow -Wait 2>$null
+            Write-Host "  ${DIM}A browser window should have opened — log in with your Tailscale account.${R}"
+            Write-Host "  ${DIM}Both Pi and Windows must use the same Tailscale account.${R}"
+        } else {
+            Write-Host "  ${YLW}winget not available. Download manually:${R}"
+            Write-Host "  ${DIM}https://tailscale.com/download/windows${R}"
+            Write-Host "  ${DIM}Install it, then open the Tailscale tray icon and log in.${R}"
+            Start-Process "https://tailscale.com/download/windows"
+        }
+    } else {
+        Write-Host "  ${DIM}Skipped. Without Tailscale the Pi<->Windows sync won't work.${R}"
+    }
 }
 
 # ── done ──────────────────────────────────────────────────────────────────────
