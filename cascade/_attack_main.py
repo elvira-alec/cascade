@@ -982,7 +982,9 @@ def main_menu(state: State):
 
 
 def _self_update():
-    repo = Path(__file__).resolve().parent.parent
+    # Prefer the known Pi deploy path; fall back to package source location
+    _known = Path("/home/kali/cascade")
+    repo = _known if (_known / ".git").exists() else Path(__file__).resolve().parent.parent
     print(f"\n  {tui.DIM}Repo: {repo}{tui.R}")
     print(f"  {tui.WH}Pulling latest from GitHub...{tui.R}")
     r = subprocess.run(["git", "pull"], cwd=str(repo), capture_output=True, text=True)
