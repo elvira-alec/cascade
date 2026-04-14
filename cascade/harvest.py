@@ -9,6 +9,7 @@ RESPONDER_PATH = "/usr/share/responder/Responder.py"
 NTLM_RE        = re.compile(
     r"(\S+)::([\w\-]+):([0-9a-fA-F]+):([0-9a-fA-F]+):([0-9a-fA-F]+)"
 )
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 _proc        = None
 _relay_proc  = None
@@ -74,10 +75,11 @@ def start(iface: str):
 
 def _reader():
     for line in _proc.stdout:
-        line = line.rstrip()
-        if line:
-            logger.info(f"[Responder] {line}")
-        m = NTLM_RE.search(line)
+        line  = line.rstrip()
+        clean = _ANSI_RE.sub("", line)   # strip Responder's colour codes before parsing
+        if clean:
+            logger.info(f"[Responder] {clean}")
+        m = NTLM_RE.search(clean)
         if m:
             user   = m.group(1)
             domain = m.group(2)

@@ -18,8 +18,10 @@ Schema per entry:
   }
 """
 
-import json, os, uuid, time
+import json, os, re, uuid, time
 from . import tui
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 VAULT_DIR  = os.path.expanduser("~/.cascade")
 VAULT_FILE = os.path.join(VAULT_DIR, "vault.json")
@@ -40,13 +42,27 @@ def _ensure_dir():
     os.makedirs(VAULT_DIR, exist_ok=True)
 
 
+def _scrub(entries: list[dict]) -> list[dict]:
+    """Strip any ANSI codes that leaked into stored fields (bug from Responder coloured output)."""
+    changed = False
+    for e in entries:
+        for field in ("username", "domain", "hash", "password"):
+            if e.get(field) and _ANSI_RE.search(str(e[field])):
+                e[field] = _ANSI_RE.sub("", str(e[field]))
+                changed  = True
+    if changed:
+        _save(entries)
+    return entries
+
+
 def _load() -> list[dict]:
     _ensure_dir()
     if not os.path.exists(VAULT_FILE):
         return []
     try:
         with open(VAULT_FILE) as f:
-            return json.load(f)
+            entries = json.load(f)
+        return _scrub(entries)
     except Exception:
         return []
 
