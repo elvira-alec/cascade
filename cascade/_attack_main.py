@@ -8,7 +8,7 @@ import os, sys, shutil, subprocess, time
 from pathlib import Path
 
 from . import tui, iface, logger
-from . import recon, harvest, spray, crack, lateral, shells, vault, exploit
+from . import recon, harvest, spray, crack, lateral, shells, vault, exploit, watch
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -873,6 +873,9 @@ def main_menu(state: State):
         print(f"  {tui.RED}{tui.B} v{tui.R}  {tui.WH}Vault — hashes & cracked creds{tui.R}"
               f"  {tui.DIM}{_vc} cracked  {_vp} pending{tui.R}")
         print()
+        print(f"  {tui.RED}{tui.B} w{tui.R}  {tui.WH}Watch mode{tui.R}"
+              f"     {tui.DIM}auto-harvest → crack → shell  (live dashboard){tui.R}")
+        print()
         print(f"  {tui.DIM}   s  Setup    f  Free commands   "
               f"l  View log   u  Update   h  Help   q  Quit{tui.R}")
         tui.divider()
@@ -943,6 +946,9 @@ def main_menu(state: State):
 
         elif raw == "9":
             shells.saved_menu()
+
+        elif raw == "w":
+            watch.run_watch(state.interface, state.subnet)
 
         elif raw == "v":
             vault_menu(state)
