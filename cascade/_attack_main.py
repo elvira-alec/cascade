@@ -7,8 +7,8 @@ Only run against networks you own or have explicit written permission to test.
 import os, sys, shutil, subprocess, time
 from pathlib import Path
 
-from . import tui, iface
-from . import recon, harvest, spray, crack, lateral, shells, vault
+from . import tui, iface, logger
+from . import recon, harvest, spray, crack, lateral, shells, vault, exploit
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -330,6 +330,36 @@ def run_stage5(state: State) -> bool:
     return True
 
 
+def run_stage6(state: State) -> bool:
+    """Stage 6 — Metasploit automated exploitation."""
+    decision = _confirm(
+        "STAGE 6 — EXPLOIT",
+        f"Metasploit auto-exploit against {len(state.hosts)} discovered host(s).\n"
+        f"  Checks MS17-010 (EternalBlue), exploits vulnerable targets,\n"
+        f"  dumps NT hashes from sessions and feeds them back to vault.",
+        "HIGH — active exploitation, very noisy, may crash unpatched targets",
+        state
+    )
+    if decision == "stop": return False
+    if decision == "skip": tui.warn("Stage 6 skipped."); return True
+
+    tui.phase("STAGE 6 — EXPLOIT")
+    if not state.hosts:
+        tui.warn("No hosts found — run recon first.")
+        return True
+
+    results = exploit.run_exploit_chain(state.hosts)
+    for r in results:
+        if r.get("success"):
+            state.compromised.append({
+                "host": next((h for h in state.hosts if h["ip"] == r["ip"]),
+                             {"ip": r["ip"], "hostname": "", "ports": []}),
+                "cred": {"user": "SYSTEM", "secret": "", "service": "msf"},
+                "method": "eternalblue",
+            })
+    return True
+
+
 # ── full kill chain ───────────────────────────────────────────────────────────
 
 def run_full_chain(state: State):
@@ -348,6 +378,7 @@ def run_full_chain(state: State):
         if not run_stage3(state): return
         if not run_stage4(state): return
         if not run_stage5(state): return
+        if not run_stage6(state): return
     except KeyboardInterrupt:
         print(f"\n\n  {tui.DIM}Interrupted.{tui.R}\n")
 
@@ -376,6 +407,9 @@ def _print_summary(state: State):
     tui.stage_result("Cred Spray",    bool(state.spray_creds),  f"{len(state.spray_creds)} valid")
     tui.stage_result("Hash Cracking", bool(state.cracked),      f"{len(state.cracked)} cracked")
     tui.stage_result("Lateral Move",  bool(state.compromised),  f"{len(state.compromised)} PWNED")
+    eb = [e for e in state.compromised if e.get("method") == "eternalblue"]
+    if eb:
+        tui.stage_result("Exploit",   True,  f"{len(eb)} via EternalBlue")
 
     if state.all_creds():
         print()
@@ -827,12 +861,14 @@ def main_menu(state: State):
         print(f"  {tui.RED}{tui.B} 5{tui.R}  {tui.WH}Crack hashes{tui.R}"
               f"   {tui.DIM}hashcat NTLMv2 against wordlist{tui.R}")
         print(f"  {tui.RED}{tui.B} 6{tui.R}  {tui.WH}Lateral movement{tui.R}"
-              f"  {tui.DIM}CrackMapExec + SSH with found credentials{tui.R}")
+              f"  {tui.DIM}CrackMapExec + SSH, secretsdump, pass-the-hash{tui.R}")
+        print(f"  {tui.RED}{tui.B} 7{tui.R}  {tui.WH}Exploit{tui.R}"
+              f"         {tui.DIM}Metasploit auto-exploit (EternalBlue + more){tui.R}")
         print()
-        print(f"  {tui.RED}{tui.B} 7{tui.R}  {tui.WH}Shell manager{tui.R}"
+        print(f"  {tui.RED}{tui.B} 8{tui.R}  {tui.WH}Shell manager{tui.R}"
               f"  {tui.DIM}connect to compromised hosts — "
               f"{len(state.compromised)} available{tui.R}")
-        print(f"  {tui.RED}{tui.B} 8{tui.R}  {tui.WH}Saved sessions{tui.R}"
+        print(f"  {tui.RED}{tui.B} 9{tui.R}  {tui.WH}Saved sessions{tui.R}"
               f" {tui.DIM}reconnect to previously compromised hosts{tui.R}")
         print()
         _vc = len(vault.cracked_entries())
@@ -840,8 +876,8 @@ def main_menu(state: State):
         print(f"  {tui.RED}{tui.B} v{tui.R}  {tui.WH}Vault — hashes & cracked creds{tui.R}"
               f"  {tui.DIM}{_vc} cracked  {_vp} pending{tui.R}")
         print()
-        print(f"  {tui.DIM}   s  Setup    f  Free commands (bash)   "
-              f"u  Update   h  Help / about   q  Quit{tui.R}")
+        print(f"  {tui.DIM}   s  Setup    f  Free commands   "
+              f"l  View log   u  Update   h  Help   q  Quit{tui.R}")
         tui.divider()
         print()
 
@@ -884,12 +920,16 @@ def main_menu(state: State):
             input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
 
         elif raw == "7":
+            tui.clear(); tui.print_banner(); _context_hint(state)
+            run_stage6(state)
+            input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
+
+        elif raw == "8":
             if state.compromised:
                 shells.access_menu(state.compromised)
             else:
                 tui.clear(); tui.print_banner()
                 tui.warn("No compromised hosts yet — run the kill chain first.")
-                # Still let user try with any found creds
                 creds = state.all_creds()
                 if creds:
                     targets = [
@@ -904,7 +944,7 @@ def main_menu(state: State):
                             continue
                 input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
 
-        elif raw == "8":
+        elif raw == "9":
             shells.saved_menu()
 
         elif raw == "v":
@@ -920,6 +960,18 @@ def main_menu(state: State):
 
         elif raw == "h":
             _print_about()
+
+        elif raw == "l":
+            tui.clear()
+            print(f"\n  {tui.WH}{tui.B}CASCADE LOG{tui.R}  {tui.DIM}{logger.path()}{tui.R}\n")
+            for line in logger.tail(60):
+                lvl_col = (tui.RED   if "[ERROR" in line else
+                           tui.YLW   if "[WARN"  in line else
+                           tui.GRN   if "[SUCCESS" in line else
+                           tui.DIM)
+                print(f"  {lvl_col}{line}{tui.R}")
+            print()
+            input(f"  {tui.DIM}[ press Enter ]{tui.R}")
 
         elif raw == "u":
             _self_update()

