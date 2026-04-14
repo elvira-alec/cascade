@@ -2,10 +2,104 @@
 cracker.py — GPU hash cracker and Pi sync logic for CascadeCracker.
 """
 
-import json, os, sys, subprocess, argparse, time
+import json, os, sys, subprocess, argparse, time, platform
 from pathlib import Path
 from datetime import datetime
 from . import config as cfg_mod
+
+
+# ── Windows SSH server self-setup ─────────────────────────────────────────────
+
+def _is_admin() -> bool:
+    """Check if the current process is running as Windows admin."""
+    if platform.system() != "Windows":
+        return True
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _relaunch_as_admin(flag: str):
+    """Re-launch cascade.exe / python with the given flag as administrator."""
+    import ctypes
+    exe  = sys.executable
+    args = " ".join([f'"{a}"' for a in sys.argv] + [flag])
+    ret  = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, args, None, 1)
+    # ret > 32 means success — the new elevated process is running
+    return int(ret) > 32
+
+
+def _setup_ssh_server_as_admin(pi_pub_key: str = ""):
+    """
+    Run with admin rights — install/start OpenSSH, add firewall rule, add Pi key.
+    Called either directly (already admin) or via --setup-ssh-admin flag.
+    """
+    import subprocess, platform
+    if platform.system() != "Windows":
+        print("SSH server setup only needed on Windows.")
+        return
+
+    ps = ["powershell", "-NoProfile", "-NonInteractive", "-Command"]
+
+    def run(cmd: str):
+        r = subprocess.run(ps + [cmd], capture_output=True, text=True)
+        return r.stdout.strip(), r.stderr.strip(), r.returncode
+
+    print(f"  {WH}Installing OpenSSH Server feature...{R}")
+    out, err, rc = run("Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null; echo done")
+    print(f"  {GRN if 'done' in out else YLW}{out or err}{R}")
+
+    print(f"  {WH}Starting sshd and setting auto-start...{R}")
+    run("Start-Service sshd -ErrorAction SilentlyContinue")
+    run("Set-Service -Name sshd -StartupType Automatic -ErrorAction SilentlyContinue")
+    out, _, _ = run("(Get-Service sshd).Status")
+    print(f"  {GRN}sshd: {out}{R}")
+
+    print(f"  {WH}Adding firewall rule for port 22...{R}")
+    run("if (-not (Get-NetFirewallRule -Name OpenSSH-Server-In-TCP -EA SilentlyContinue)) "
+        "{ New-NetFirewallRule -Name OpenSSH-Server-In-TCP -DisplayName 'OpenSSH Server' "
+        "-Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 }")
+    print(f"  {GRN}Firewall rule OK.{R}")
+
+    if pi_pub_key and pi_pub_key.startswith("ssh-"):
+        auth_file = Path(r"C:\ProgramData\ssh\administrators_authorized_keys")
+        auth_file.parent.mkdir(parents=True, exist_ok=True)
+        existing = auth_file.read_text() if auth_file.exists() else ""
+        if pi_pub_key not in existing:
+            with open(auth_file, "a") as f:
+                f.write("\n" + pi_pub_key + "\n")
+        # Fix ACL
+        run(f'icacls "{auth_file}" /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F"')
+        print(f"  {GRN}Pi public key added to authorized_keys.{R}")
+
+    print(f"\n  {GRN}SSH server setup complete.{R}")
+
+
+def setup_ssh_server(pi_pub_key: str = ""):
+    """
+    Entry point for SSH server setup from the crack mode menu.
+    If already admin, run directly. Otherwise relaunch elevated.
+    """
+    if platform.system() != "Windows":
+        print(f"  {YLW}SSH server setup is only needed on Windows.{R}")
+        return
+
+    if _is_admin():
+        _setup_ssh_server_as_admin(pi_pub_key)
+    else:
+        print(f"  {WH}Admin rights needed to install SSH server.{R}")
+        print(f"  {DIM}A UAC prompt will appear — click Yes to continue.{R}")
+        flag = f"--setup-ssh-admin"
+        if pi_pub_key:
+            flag += f" --pi-pub-key \"{pi_pub_key}\""
+        launched = _relaunch_as_admin(flag)
+        if launched:
+            print(f"  {GRN}Elevated process launched. Waiting for it to complete...{R}")
+            time.sleep(5)   # give elevated process time to run
+        else:
+            print(f"  {RED}Could not launch elevated process. Run cascade.exe as Administrator manually.{R}")
 
 RED = "\033[91m"; GRN = "\033[92m"; YLW = "\033[93m"
 WH  = "\033[97m"; DIM = "\033[2m";  B   = "\033[1m"; R = "\033[0m"
@@ -324,7 +418,17 @@ def main():
     ap.add_argument("--pull-and-crack", action="store_true",
                     help="Headless: pull → crack → push, then exit")
     ap.add_argument("--pi-host", help="Override Pi Tailscale IP")
+    ap.add_argument("--setup-ssh-admin", action="store_true",
+                    help="(Internal) Run SSH server setup as admin, then exit")
+    ap.add_argument("--pi-pub-key", help="Pi public key to add to authorized_keys",
+                    default="")
     args = ap.parse_args()
+
+    # ── headless SSH server setup (called via UAC relaunch) ───────────────────
+    if args.setup_ssh_admin:
+        _setup_ssh_server_as_admin(args.pi_pub_key)
+        input("  Press Enter to close...")
+        return
 
     cfg = cfg_mod.load()
     cfg = cfg_mod.auto_populate(cfg)
@@ -359,6 +463,7 @@ def main():
         print(f"  {RED}{B}6{R}  View cracked passwords")
         print()
         print(f"  {RED}{B}d{R}  Doctor / diagnostics       {DIM}check everything, fix setup issues{R}")
+        print(f"  {RED}{B}x{R}  Setup SSH server           {DIM}enable Pi remote access — runs as admin{R}")
         print(f"  {RED}{B}u{R}  Update                     {DIM}git pull + reinstall latest version{R}")
         print(f"  {RED}{B}c{R}  Configure")
         print(f"  {RED}{B}q{R}  Quit")
@@ -416,6 +521,11 @@ def main():
         elif raw == "u":
             _self_update()
             input(f"\n  {DIM}[ press Enter — cascade will restart on next launch ]{R}")
+
+        elif raw == "x":
+            pub_key = input(f"  {DIM}Pi public key (Enter to skip): {R}").strip()
+            setup_ssh_server(pub_key)
+            input(f"\n  {DIM}[ press Enter ]{R}")
 
         elif raw == "c":
             cfg = config_menu(cfg)

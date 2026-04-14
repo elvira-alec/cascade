@@ -4,11 +4,29 @@ Cascade — Post-Exploitation Orchestrator
 Only run against networks you own or have explicit written permission to test.
 """
 
-import os, sys, shutil, subprocess, time
+import os, sys, shutil, subprocess, time, json, socket
 from pathlib import Path
 
 from . import tui, iface, logger
 from . import recon, harvest, spray, crack, lateral, shells, vault, exploit, watch
+
+# ── Pi-side persistent config ─────────────────────────────────────────────────
+# Stored at /root/.cascade/config.json — separate from the vault.
+# Used to remember the Windows GPU machine's Tailscale IP, SSH user, etc.
+
+_PI_CONFIG_FILE = Path(os.path.expanduser("~/.cascade/config.json"))
+
+def _pi_cfg_load() -> dict:
+    if _PI_CONFIG_FILE.exists():
+        try:
+            return json.loads(_PI_CONFIG_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def _pi_cfg_save(cfg: dict):
+    _PI_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _PI_CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -612,6 +630,10 @@ def setup_menu(state: State):
               f"          {tui.DIM}{'on' if state.verbose else 'off'}{tui.R}")
         print(f"  {tui.RED}{tui.B}10{tui.R}  {tui.WH}Tool status{tui.R}"
               f"             {tui.DIM}what's installed, what's missing{tui.R}")
+        _wcfg = _pi_cfg_load()
+        _whost = _wcfg.get("windows_host", "not set")
+        print(f"  {tui.RED}{tui.B}11{tui.R}  {tui.WH}Configure GPU machine{tui.R}"
+              f"   {tui.DIM}Windows host for remote GPU crack  [{_whost}]{tui.R}")
         tui.divider()
         print(f"\n  {tui.DIM}   0 / Enter → back{tui.R}\n")
 
@@ -670,6 +692,9 @@ def setup_menu(state: State):
             tui.clear(); tui.print_banner(); tui.phase("TOOL STATUS")
             iface.print_tool_status()
             input(f"  {tui.DIM}[ press Enter to go back ]{tui.R}")
+
+        elif raw == "11":
+            _setup_gpu_machine()
 
 
 # ── about / help ──────────────────────────────────────────────────────────────
@@ -875,6 +900,12 @@ def main_menu(state: State):
         print()
         print(f"  {tui.RED}{tui.B} w{tui.R}  {tui.WH}Watch mode{tui.R}"
               f"     {tui.DIM}auto-harvest → crack → shell  (live dashboard){tui.R}")
+        _win_cfg  = _pi_cfg_load()
+        _win_host = _win_cfg.get("windows_host", "")
+        _win_lbl  = (f"{tui.DIM}→ {_win_host}{tui.R}" if _win_host
+                     else f"{tui.YLW}not configured — Setup → 11{tui.R}")
+        print(f"  {tui.RED}{tui.B} g{tui.R}  {tui.WH}GPU crack (remote){tui.R}"
+              f"  {tui.DIM}SSH → Windows, crack with GPU, sync back  {tui.R}{_win_lbl}")
         print()
         print(f"  {tui.DIM}   s  Setup    f  Free commands   "
               f"l  View log   u  Update   h  Help   q  Quit{tui.R}")
@@ -950,6 +981,9 @@ def main_menu(state: State):
         elif raw == "w":
             watch.run_watch(state.interface, state.subnet)
 
+        elif raw == "g":
+            _gpu_crack_via_ssh(state)
+
         elif raw == "v":
             vault_menu(state)
 
@@ -979,6 +1013,165 @@ def main_menu(state: State):
         elif raw == "u":
             _self_update()
             input(f"\n  {tui.DIM}[ press Enter — restart cascade to use the new version ]{tui.R}")
+
+
+def _gpu_crack_via_ssh(state: State):
+    """
+    SSH from the Pi into the Windows GPU machine and trigger cascade --pull-and-crack.
+    Windows pulls vault from Pi, cracks with GPU + rules, pushes cracked vault back.
+    """
+    tui.clear()
+    tui.print_banner()
+    tui.phase("GPU CRACK — REMOTE WINDOWS")
+
+    cfg = _pi_cfg_load()
+    win_host = cfg.get("windows_host", "")
+    win_user = cfg.get("windows_user", "")
+    win_port = cfg.get("windows_ssh_port", 22)
+
+    if not win_host or not win_user:
+        tui.warn("Windows GPU machine not configured. Go to Setup → Configure GPU machine.")
+        input(f"\n  {tui.DIM}[ press Enter to go back ]{tui.R}")
+        return
+
+    # Get our own Tailscale IP so Windows can SCP vault back to us
+    try:
+        pi_ip = subprocess.check_output(
+            ["tailscale", "ip", "--4"], text=True,
+            stderr=subprocess.DEVNULL, timeout=5
+        ).strip()
+    except Exception:
+        pi_ip = subprocess.check_output(
+            ["hostname", "-I"], text=True
+        ).strip().split()[0]
+
+    cascade_exe = cfg.get("windows_cascade_exe", "cascade")
+
+    tui.info(f"Connecting to {win_user}@{win_host}:{win_port} ...")
+    tui.info(f"Pi Tailscale: {pi_ip}")
+    print()
+
+    # Build SSH command
+    key_opt = []
+    key = cfg.get("windows_ssh_key", "")
+    if key and Path(key).exists():
+        key_opt = ["-i", key]
+
+    ssh_cmd = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ConnectTimeout=15",
+        "-o", "BatchMode=yes",
+        "-p", str(win_port),
+    ] + key_opt + [
+        f"{win_user}@{win_host}",
+        f"{cascade_exe} --pull-and-crack --pi-host {pi_ip}"
+    ]
+
+    tui.info(f"Running: {' '.join(ssh_cmd)}")
+    print()
+
+    try:
+        result = subprocess.run(ssh_cmd, timeout=900)
+        if result.returncode == 0:
+            tui.success("GPU crack complete! Vault should be updated.")
+            # Reload vault display
+            vc = len(vault.cracked_entries())
+            vp = len(vault.pending_hashes())
+            tui.info(f"Vault: {tui.GRN}{vc} cracked{tui.R}  {tui.YLW}{vp} still pending{tui.R}")
+        else:
+            tui.error(f"SSH command returned {result.returncode}.")
+            tui.info("Check: Windows SSH running? Pi key authorized? cascade installed on Windows?")
+    except subprocess.TimeoutExpired:
+        tui.error("Timed out waiting for GPU crack (15 min limit).")
+    except FileNotFoundError:
+        tui.error("ssh not found — install openssh-client: sudo apt install openssh-client")
+
+    input(f"\n  {tui.DIM}[ press Enter to return to menu ]{tui.R}")
+
+
+def _setup_gpu_machine():
+    """
+    Interactive setup: configure the Windows GPU machine for SSH-triggered cracking.
+    Generates Pi SSH key if needed, tests connection, saves config.
+    """
+    tui.clear()
+    tui.print_banner()
+    tui.phase("SETUP — WINDOWS GPU MACHINE")
+
+    cfg = _pi_cfg_load()
+
+    print(f"  {tui.DIM}Configure your Windows machine so the Pi can trigger GPU cracking via SSH.{tui.R}")
+    print(f"  {tui.DIM}On Windows: run cascade, then press x to set up the SSH server (runs as admin).{tui.R}")
+    print()
+
+    # ── Step 1: Windows host ──────────────────────────────────────────────────
+    cur_host = cfg.get("windows_host", "")
+    v = input(f"  {tui.WH}Windows Tailscale IP [{cur_host or 'e.g. 100.x.x.x'}]: {tui.R}").strip()
+    if v: cfg["windows_host"] = v
+    if not cfg.get("windows_host"):
+        tui.warn("No host set. Aborting.")
+        return
+
+    cur_user = cfg.get("windows_user", "")
+    v = input(f"  {tui.WH}Windows username [{cur_user or 'e.g. Alec'}]: {tui.R}").strip()
+    if v: cfg["windows_user"] = v
+
+    v = input(f"  {tui.WH}SSH port [{cfg.get('windows_ssh_port', 22)}]: {tui.R}").strip()
+    if v:
+        try: cfg["windows_ssh_port"] = int(v)
+        except ValueError: pass
+
+    cascade_exe = cfg.get("windows_cascade_exe", "cascade")
+    v = input(f"  {tui.WH}cascade.exe path on Windows [{cascade_exe}]: {tui.R}").strip()
+    if v: cfg["windows_cascade_exe"] = v
+
+    # ── Step 2: Generate / show Pi SSH key ────────────────────────────────────
+    key_file = Path("/root/.ssh/cascade_win_ed25519")
+    if not key_file.exists():
+        tui.info("Generating SSH key for Pi → Windows auth ...")
+        subprocess.run(["ssh-keygen", "-t", "ed25519", "-f", str(key_file),
+                        "-N", "", "-q", "-C", "cascade-pi"],
+                       check=True)
+        tui.success(f"Key created: {key_file}")
+
+    cfg["windows_ssh_key"] = str(key_file)
+    pub_key = (key_file.parent / (key_file.name + ".pub")).read_text().strip()
+
+    print()
+    print(f"  {tui.WH}{tui.B}Add this public key to your Windows machine:{tui.R}")
+    print(f"  {tui.DIM}File: C:\\ProgramData\\ssh\\administrators_authorized_keys{tui.R}")
+    print(f"  {tui.DIM}On Windows cascade → x (Setup SSH server) → paste this key when prompted{tui.R}")
+    print()
+    print(f"  {tui.YLW}{pub_key}{tui.R}")
+    print()
+    input(f"  {tui.DIM}[ Add the key on Windows, then press Enter to test the connection ]{tui.R}")
+
+    # ── Step 3: Test connection ───────────────────────────────────────────────
+    tui.info("Testing SSH connection ...")
+    ssh_test = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ConnectTimeout=10",
+        "-o", "BatchMode=yes",
+        "-i", str(key_file),
+        "-p", str(cfg.get("windows_ssh_port", 22)),
+        f"{cfg['windows_user']}@{cfg['windows_host']}",
+        "echo cascade-ok"
+    ]
+    r = subprocess.run(ssh_test, capture_output=True, text=True, timeout=15)
+    if "cascade-ok" in r.stdout:
+        tui.success("Connection works!")
+        cfg["_ssh_tested"] = True
+    else:
+        tui.error("Connection failed.")
+        tui.info(f"  stderr: {r.stderr.strip()[:200]}")
+        tui.info("  Check: SSH server running on Windows? Key added to authorized_keys?")
+        tui.info("  Saving config anyway — fix the issue and retry from Setup.")
+
+    _pi_cfg_save(cfg)
+    tui.success("Config saved.")
+    input(f"\n  {tui.DIM}[ press Enter to go back ]{tui.R}")
 
 
 def _self_update():
