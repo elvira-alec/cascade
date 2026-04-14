@@ -6,8 +6,11 @@ import subprocess, threading, time, re, os, shutil, socket
 from . import tui, logger
 
 RESPONDER_PATH = "/usr/share/responder/Responder.py"
+# NTLMv2 format: USER::DOMAIN:CHALLENGE(16 hex):NTPROOF(32 hex):BLOB(32+ hex)
+# Minimum length guards prevent IPv6 addresses (fe80::xxxx:xxxx:xxxx:xxxx)
+# from matching (their hex segments are only 1-4 chars each).
 NTLM_RE        = re.compile(
-    r"(\S+)::([\w\-]+):([0-9a-fA-F]+):([0-9a-fA-F]+):([0-9a-fA-F]+)"
+    r"(\S+)::([\w\-]+):([0-9a-fA-F]{16,}):([0-9a-fA-F]{32,}):([0-9a-fA-F]{32,})"
 )
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
