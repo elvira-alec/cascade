@@ -5,6 +5,11 @@ Run on any machine: chooses Attack mode (Pi/Linux) or Crack mode (Windows/GPU).
 
 import os, sys, platform
 
+# Force UTF-8 output on Windows so Unicode box characters don't crash
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 RED = "\033[91m"; GRN = "\033[92m"; YLW = "\033[93m"
 WH  = "\033[97m"; DIM = "\033[2m";  B   = "\033[1m"; R = "\033[0m"
 
