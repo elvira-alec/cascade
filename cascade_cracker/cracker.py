@@ -37,7 +37,7 @@ def pull_from_pi(cfg: dict) -> int:
     """SCP vault.json from Pi. Returns count of pending hashes."""
     host     = cfg["pi_host"]
     user     = cfg["pi_user"]
-    vault    = cfg.get("pi_vault_path", "/root/.cascade/vault.json")
+    vault    = cfg.get("pi_vault_path", "/home/kali/.cascade/vault.json")
     key      = cfg.get("pi_ssh_key", "")
 
     print(f"  {DIM}Pulling vault from {user}@{host} ...{R}")

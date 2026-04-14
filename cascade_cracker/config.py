@@ -25,7 +25,7 @@ DEFAULTS = {
     "pi_host":       "100.119.123.7",
     "pi_user":       "kali",
     "pi_ssh_key":    "",          # auto-discovered if blank
-    "pi_vault_path": "/root/.cascade/vault.json",
+    "pi_vault_path": "/home/kali/.cascade/vault.json",
 
     # Windows SSH (for Pi → Windows)
     "windows_ssh_user": "",       # auto = current user
