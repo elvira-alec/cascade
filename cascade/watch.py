@@ -314,10 +314,24 @@ def run_watch(iface: str, subnet: str = None):
     state = WatchState(iface, subnet)
 
     # Seed known cracked creds from existing vault entries
-    for e in vault.cracked_entries():
+    cracked = vault.cracked_entries()
+    for e in cracked:
         state._shell_q.put({"user": e["username"], "secret": e["password"]})
-    if vault.cracked_entries():
-        state.log(f"Loaded {len(vault.cracked_entries())} cracked creds from vault", "info")
+    if cracked:
+        state.log(f"Loaded {len(cracked)} cracked creds from vault", "info")
+
+    # Also retry any pending (unsolved) hashes with quick CPU crack on startup
+    pending = vault.pending_hashes()
+    if pending:
+        state.log(f"Retrying {len(pending)} pending vault hashes (CPU pass) ...", "info")
+        def _retry_pending():
+            results = crack.crack_ntlmv2_quick(pending, target_ip="vault",
+                                               cpu_timeout=120)
+            for r in results:
+                state.cracked_count += 1
+                state.log(f"CRACKED (vault): {r['user']} → {r['password']}", "success")
+                state._shell_q.put({"user": r["user"], "secret": r["password"]})
+        threading.Thread(target=_retry_pending, daemon=True, name="vault_retry").start()
 
     threads = [
         threading.Thread(target=_responder_thread, args=(state,), daemon=True, name="responder"),
@@ -344,8 +358,8 @@ def run_watch(iface: str, subnet: str = None):
     try:
         while state.running:
             state._tick += 1
-            # Move cursor to top, redraw — no flicker
-            sys.stdout.write("\033[H")
+            # Clear screen + home, then redraw (prevents bleed-through on line count changes)
+            sys.stdout.write("\033[2J\033[H")
             sys.stdout.write(_render(state))
             sys.stdout.flush()
             time.sleep(_REFRESH)
