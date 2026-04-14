@@ -2,7 +2,7 @@
 spray.py — Default credential spray over SSH, SMB, HTTP admin panels
 """
 
-import socket, threading, time
+import socket, subprocess, threading, time
 from . import tui
 
 # ── default credential lists ──────────────────────────────────────────────────

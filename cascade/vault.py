@@ -85,13 +85,29 @@ def add_hash(target_ip: str, username: str, domain: str,
     Add a new captured hash to the vault.
     Returns the entry id.
     Deduplicates by username+domain+target (keeps latest).
+    Preserves cracked status/password if the entry was already cracked.
     """
     entries = _load()
+    # Check if an existing cracked entry would be displaced
+    existing = next((e for e in entries
+                     if e["username"] == username and
+                        e["domain"]   == domain   and
+                        e["target_ip"] == target_ip), None)
     # Remove stale duplicate
     entries = [e for e in entries
                if not (e["username"] == username and
                        e["domain"]   == domain   and
                        e["target_ip"] == target_ip)]
+    # Preserve cracked result if the hash was already solved
+    if existing and existing["status"] == "cracked":
+        status     = "cracked"
+        password   = existing["password"]
+        cracked_ts = existing["cracked_ts"]
+    else:
+        status     = "pending"
+        password   = None
+        cracked_ts = None
+
     entry_id = uuid.uuid4().hex[:8]
     entries.append({
         "id":         entry_id,
@@ -102,9 +118,9 @@ def add_hash(target_ip: str, username: str, domain: str,
         "hash":       hash_line,
         "hash_type":  hash_type,
         "hc_mode":    HC_MODES.get(hash_type, 5600),
-        "status":     "pending",
-        "password":   None,
-        "cracked_ts": None,
+        "status":     status,
+        "password":   password,
+        "cracked_ts": cracked_ts,
     })
     _save(entries)
     return entry_id
