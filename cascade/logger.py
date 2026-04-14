@@ -11,12 +11,13 @@ import os, time
 from pathlib import Path
 
 LOG_DIR  = Path.home() / ".cascade"
-LOG_FILE = LOG_DIR / "cascade.log"
-_MAX_BYTES = 5 * 1024 * 1024  # 5 MB — rotate when exceeded
+# Log to /tmp (tmpfs/RAM on Linux) to avoid wearing microSD cells.
+# Lost on reboot — that's fine for a debug log. Vault stays on microSD.
+LOG_FILE   = Path("/tmp/cascade.log")
+_MAX_BYTES = 5 * 1024 * 1024  # 5 MB cap (in RAM)
 
 
 def _write(level: str, msg: str):
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
     # Rotate if too large
     try:
         if LOG_FILE.exists() and LOG_FILE.stat().st_size > _MAX_BYTES:
